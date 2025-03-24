@@ -1,119 +1,89 @@
-# Latent Transformer for Multiplication
+# Transformer Architecture Comparison
 
-This project implements and compares two transformer architectures for learning the multiplication task:
-1. **SimpleTransformer**: A standard encoder-decoder transformer
-2. **LatentTransformer**: A transformer that uses latent tokens as an intermediate representation
+This project compares two transformer architectures for sequence-to-sequence tasks, with a focus on the multiplication task:
+
+1. **SimpleTransformer**: A standard encoder-decoder transformer architecture.
+2. **LatentTransformer**: A modified architecture with a latent bottleneck between encoder and decoder.
 
 ## Project Structure
 
-```
-├── Collate.py              # Collate function for batching sequences
-├── compare_models.py       # Script to compare model performance
-├── config.py               # Configuration parameters
-├── Dataset.py              # Dataset implementation for multiplication task
-├── dataset_size_estimate.py # Memory usage estimation script
-├── train.py                # Training script for SimpleTransformer
-├── train2.py               # Training script for LatentTransformer
-├── Transformer.py          # Model implementations
-├── utils.py                # Utility functions for training and evaluation
-└── requirements.txt        # Package dependencies
-```
+- `Transformer.py`: Contains implementations of both transformer architectures
+- `Dataset.py`: Implementation of the multiplication dataset
+- `Collate.py`: Collation function for batch processing
+- `config.py`: Configuration parameters for training
 
-## Requirements
+### Comparison Scripts
 
-- PyTorch
-- tensorboard
-- numpy
+- `fair_comparison.py`: Script for comparing both architectures with fair parameter settings
+- `stable_comparison.py`: More numerically stable version of the comparison script 
+- `inference_comparison.py`: Script for comparing inference results without training
+- `transformer_comparison_results.md`: Summary of findings and recommendations
+
+## Main Architectural Differences
+
+1. **SimpleTransformer**:
+   - Standard encoder-decoder transformer architecture
+   - Direct attention from decoder to encoder memory
+   - Parameter count scales linearly with input sequence length
+
+2. **LatentTransformer**:
+   - Uses a fixed set of latent tokens as an information bottleneck
+   - Decoder only attends to latent tokens, not full encoder memory
+   - Parameter count is less dependent on input sequence length
+
+## Running the Comparison
+
+### Prerequisites
+
+- Python 3.10 or higher
+- PyTorch 2.0 or higher
+- NumPy
 - tqdm
-- psutil (for memory monitoring)
 
-To install all required packages:
-```bash
-pip install -r requirements.txt
-```
+### Basic Usage
 
-## Dataset
-
-The dataset consists of multiplication problems between two-digit numbers (e.g., "23*45") and their results (e.g., "1035"). The dataset implementation:
-
-- Supports train/validation/test splits
-- Generates samples on-the-fly for training to save memory
-- Pre-computes validation and test samples for consistency
-- Can handle large dataset sizes efficiently
-
-To check if your system can handle the dataset size:
-```bash
-python dataset_size_estimate.py
-```
-
-## Training the Models
-
-### SimpleTransformer
+For a basic comparison:
 
 ```bash
-python train.py
+python fair_comparison.py --d-model 128 --num-layers 3 --num-latent 8
 ```
 
-### LatentTransformer
+For improved stability:
 
 ```bash
-python train2.py
+python stable_comparison.py --d-model 32 --num-layers 2 --num-latent 4 --max-steps 500
 ```
 
-Both training scripts support the same configuration options defined in `config.py`. The training process includes:
-- Learning rate warmup
-- Gradient clipping
-- Early stopping
-- Model checkpointing
-- Validation and test set evaluation
-
-## Monitoring Training Progress
-
-Training metrics are logged to TensorBoard:
-```bash
-tensorboard --logdir runs
-```
-
-This will display:
-- Training loss curves
-- Validation loss curves
-- Test loss (evaluated periodically)
-- Learning rate schedule
-
-## Comparing Models
-
-After training both models, you can compare their performance with:
+To compare inference without training:
 
 ```bash
-python compare_models.py
+python inference_comparison.py --use-dummy-weights
 ```
 
-This script will provide:
-- A summary of the best validation loss for each model
-- The latest training and validation metrics
-- Direct TensorBoard command for detailed visualization
+Using pre-trained models (if available):
 
-## Architecture Details
+```bash
+python inference_comparison.py --simple-checkpoint=checkpoints/simple/best.pt --latent-checkpoint=checkpoints/latent/best.pt
+```
 
-### SimpleTransformer
+## Key Findings
 
-A standard encoder-decoder transformer architecture with:
-- Encoder: Processes the input sequence (e.g., "23*45")
-- Decoder: Generates the output sequence (e.g., "1035")
+The theoretical advantages of the LatentTransformer include:
 
-### LatentTransformer
+- Fixed computational cost for decoder regardless of input length
+- Information distillation through latent tokens
+- Reduced memory requirements for long sequences
 
-A modified transformer architecture that introduces latent tokens:
-- Encoder: Processes the input sequence
-- Latent Tokens: A fixed set of learnable tokens that attend to the encoder output
-- Decoder: Attends to the latent tokens (not directly to the encoder output) to generate the output
+However, practical challenges were encountered:
 
-The key innovation is that the latent tokens serve as an information bottleneck, forcing the model to compress the relevant information about the task.
+- Both models showed numerical stability issues
+- MPS backend limitations affected transformer operations on Apple Silicon
+- The additional complexity of LatentTransformer may not be justified for simpler tasks
 
-## Checkpoints
+For detailed findings, see the [comparison results](transformer_comparison_results.md).
 
-Model checkpoints are saved in the `checkpoints/` directory with the following structure:
-- `checkpoints/simple_transformer/simple_transformer_best.pt`: Best SimpleTransformer model
-- `checkpoints/latent_transformer/latent_transformer_best.pt`: Best LatentTransformer model
+## Future Work
 
-Regular checkpoints are also saved every N epochs for each model. 
+- Evaluate on more stable hardware (CUDA GPU)
+- Conduct proper hyperparameter tuning once stability issues are resolved
+- Experiment with longer sequence tasks where LatentTransformer might show stronger advantages 

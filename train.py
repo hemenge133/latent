@@ -23,7 +23,10 @@ def main():
     config = TrainingConfig()
     
     # Setup device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if torch.backends.mps.is_available():
+        device = torch.device('mps')
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
     # Setup tensorboard writer
@@ -142,10 +145,55 @@ def main():
             writer.add_scalar('Loss/train', loss.item(), global_step)
             writer.add_scalar('LR', optimizer.param_groups[0]['lr'], global_step)
             pbar.set_postfix(loss=loss.item())
+            
+            # Add frequent validation (every N steps)
+            if hasattr(config, 'validate_every_n_steps') and global_step % config.validate_every_n_steps == 0:
+                model.eval()
+                val_loss_step = evaluate(
+                    model=model,
+                    data_loader=val_loader,
+                    criterion=criterion,
+                    device=device,
+                    vocab_size=train_dataset.vocab_size,
+                    desc="Step Validation"
+                )
+                writer.add_scalar('Loss/val_step', val_loss_step, global_step)
+                print(f"\nStep {global_step} - Val Loss: {val_loss_step:.4f}")
+                
+                # Save model if validation loss improved
+                if val_loss_step < best_val_loss:
+                    best_val_loss = val_loss_step
+                    patience_counter = 0
+                    save_checkpoint(
+                        model=model,
+                        optimizer=optimizer,
+                        epoch=epoch,
+                        train_loss=total_loss / (step + 1),  # Approximate current epoch loss
+                        val_loss=val_loss_step,
+                        save_path=f"{save_dir}/{config.simple_transformer_name}_best.pt",
+                        is_best=True
+                    )
+                    print(f"New best model saved with val loss: {best_val_loss:.4f}")
+                model.train()  # Return to training mode
+            
+            # Add frequent testing (every M steps)
+            if hasattr(config, 'test_every_n_steps') and global_step % config.test_every_n_steps == 0:
+                model.eval()
+                test_loss_step = evaluate(
+                    model=model,
+                    data_loader=test_loader,
+                    criterion=criterion,
+                    device=device,
+                    vocab_size=train_dataset.vocab_size,
+                    desc="Step Test"
+                )
+                writer.add_scalar('Loss/test_step', test_loss_step, global_step)
+                print(f"\nStep {global_step} - Test Loss: {test_loss_step:.4f}")
+                model.train()  # Return to training mode
         
         train_loss = total_loss / len(train_loader)
         
-        # Evaluate on validation set
+        # Evaluate on validation set (still keep epoch validation for consistency)
         val_loss = evaluate(
             model=model,
             data_loader=val_loader,
@@ -154,19 +202,6 @@ def main():
             vocab_size=train_dataset.vocab_size,
             desc="Validation"
         )
-        
-        # Evaluate on test set every N epochs
-        if (epoch + 1) % config.test_every == 0:
-            test_loss = evaluate(
-                model=model,
-                data_loader=test_loader,
-                criterion=criterion,
-                device=device,
-                vocab_size=train_dataset.vocab_size,
-                desc="Test"
-            )
-            writer.add_scalar('Loss/test', test_loss, epoch)
-            print(f"Test Loss: {test_loss:.4f}")
         
         # Log metrics
         writer.add_scalar('Loss/train_epoch', train_loss, epoch)
