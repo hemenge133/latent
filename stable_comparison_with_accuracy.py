@@ -17,7 +17,7 @@ import random
 import argparse
 
 from Dataset import MultiplicationDataset
-from Collate import collate_fn
+from utils import collate_fn
 from config import TrainingConfig
 
 def count_parameters(model):
@@ -212,10 +212,10 @@ class StableLatentTransformer(nn.Module):
         v = self.latent_proj_v(value)  # [batch_size, seq_len, d_model]
         
         # Calculate attention scores [batch_size, num_latent, seq_len]
-        scores = torch.bmm(q, k.transpose(1, 2)) / (self.d_model ** 0.5)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_model)
         
         if attn_mask is not None:
-            scores = scores.masked_fill(attn_mask == 0, -1e9)
+            scores = scores.masked_fill(attn_mask == 0, -1e4)  # Using -1e4 instead of -1e9 to avoid FP16 overflow
             
         # Apply softmax and get weighted values
         attn_weights = F.softmax(scores, dim=-1)  # [batch_size, num_latent, seq_len]

@@ -17,14 +17,87 @@ import random
 import argparse
 import itertools
 import shutil  # For removing directory trees
+import signal
+import sys
+import subprocess
 
 from Dataset import MultiplicationDataset
-from Collate import collate_fn
+from utils import collate_fn
 from config import TrainingConfig
 
 # Import the stable model implementations
 from stable_comparison_with_accuracy import StableSimpleTransformer, StableLatentTransformer
 from stable_comparison_with_accuracy import generate_multiplication_examples, inference, calculate_accuracy
+
+# Create label smoothing loss for better generalization
+class LabelSmoothingLoss(nn.Module):
+    def __init__(self, smoothing=0.1, ignore_index=0, reduction='none'):
+        super(LabelSmoothingLoss, self).__init__()
+        self.smoothing = smoothing
+        self.ignore_index = ignore_index
+        self.reduction = reduction
+        self.criterion = nn.KLDivLoss(reduction='none')
+    
+    def forward(self, inputs, targets):
+        # Flatten the inputs and targets
+        inputs = inputs.view(-1, inputs.size(-1))
+        targets = targets.view(-1)
+        
+        # Create mask for non-padding tokens
+        mask = (targets != self.ignore_index).float()
+        
+        # Create smoothed targets
+        targets_non_pad = targets * mask
+        n_class = inputs.size(1)
+        one_hot = torch.zeros_like(inputs).scatter(1, targets_non_pad.unsqueeze(1).long(), 1)
+        one_hot = one_hot * (1 - self.smoothing) + (1 - one_hot) * self.smoothing / (n_class - 1)
+        
+        # Apply log softmax to inputs
+        log_probs = F.log_softmax(inputs, dim=1)
+        
+        # Calculate KL divergence loss
+        loss = self.criterion(log_probs, one_hot)
+        loss = loss.sum(dim=1)
+        
+        # Apply mask to exclude padding tokens
+        loss = loss * mask
+        
+        # Return per-token loss for later reshaping
+        if self.reduction == 'none':
+            return loss
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:  # mean
+            return loss.sum() / mask.sum().clamp(min=1e-8)
+
+def calculate_efficiency(simple_results, latent_results):
+    print("\nEfficiency Metrics:")
+    
+    # Parameter efficiency (lower is better: loss * num_params)
+    param_efficiency_simple = simple_results['loss'] * simple_results['params']
+    param_efficiency_latent = latent_results['loss'] * latent_results['params']
+    
+    # Accuracy efficiency (higher is better: accuracy / num_params)
+    acc_param_efficiency_simple = simple_results['sequence_accuracy'] / simple_results['params'] if simple_results['params'] > 0 and simple_results['sequence_accuracy'] > 0 else 0
+    acc_param_efficiency_latent = latent_results['sequence_accuracy'] / latent_results['params'] if latent_results['params'] > 0 and latent_results['sequence_accuracy'] > 0 else 0
+    
+    if param_efficiency_latent < param_efficiency_simple:
+        ratio = param_efficiency_simple / param_efficiency_latent
+        print(f"LatentTransformer is {ratio:.2f}x more parameter-efficient (loss*params)")
+    else:
+        ratio = param_efficiency_latent / param_efficiency_simple
+        print(f"SimpleTransformer is {ratio:.2f}x more parameter-efficient (loss*params)")
+    
+    # Only show accuracy efficiency if both models have non-zero accuracy
+    if acc_param_efficiency_latent > 0 and acc_param_efficiency_simple > 0:
+        if acc_param_efficiency_latent > acc_param_efficiency_simple:
+            ratio = acc_param_efficiency_latent / acc_param_efficiency_simple
+            print(f"LatentTransformer is {ratio:.2f}x more accuracy-per-parameter efficient")
+        else:
+            ratio = acc_param_efficiency_simple / acc_param_efficiency_latent
+            print(f"SimpleTransformer is {ratio:.2f}x more accuracy-per-parameter efficient")
+    else:
+        print("Cannot calculate accuracy efficiency metrics: at least one model has 0% accuracy")
 
 def count_parameters(model):
     """Count the number of trainable parameters in a model"""
@@ -235,11 +308,42 @@ def improved_accuracy(model, examples, dataset, device, print_debug=False, num_t
     digit_accuracy = digit_correct / total_digits if total_digits > 0 else 0.0
     return sequence_accuracy, digit_accuracy
 
-def evaluate(model, data_loader, criterion, dataset, device, vocab_size, desc="Evaluating", examples=None):
+def evaluate(model, data_loader, criterion, dataset, device, vocab_size, desc="Evaluating", examples=None, rotate_examples=False):
     """Evaluate a model on a data loader with loss and accuracy"""
     model.eval()
     total_loss = 0.0
     total_samples = 0
+    
+    # If rotate_examples is True, we'll modify the validation examples
+    # to test on different number ranges
+    if examples and rotate_examples and len(examples) > 0:
+        # Create a few examples with larger numbers
+        try:
+            extra_examples = []
+            # Add examples with larger numbers to test generalization
+            for a in range(10, 20):  # Larger than typical validation examples
+                for b in range(10, 20):
+                    if len(extra_examples) >= 5:  # Just add a few
+                        break
+                    # Format input
+                    input_str = f"{a}*{b}"
+                    input_tokens = dataset.encode(input_str)
+                    input_tensor = torch.tensor([input_tokens], dtype=torch.long).to(device)
+                    
+                    # Format expected output
+                    result = a * b
+                    result_str = str(result)
+                    
+                    extra_examples.append((input_tensor, result_str, a, b))
+                if len(extra_examples) >= 5:
+                    break
+            
+            # Replace some existing examples with the new ones
+            for i, ex in enumerate(extra_examples):
+                if i < len(examples):
+                    examples[i] = ex
+        except Exception as e:
+            print(f"Warning: Error creating extra validation examples: {e}")
     
     with torch.no_grad():
         for inp, tgt, inp_lens, tgt_lens in tqdm(data_loader, desc=desc, leave=False):
@@ -263,7 +367,8 @@ def evaluate(model, data_loader, criterion, dataset, device, vocab_size, desc="E
                 batch_size = inp.size(0)
                 length_penalties = []
                 
-                for b in range(batch_size):
+                # Ensure we only access valid indices within the batch
+                for b in range(min(batch_size, inp.size(0))):
                     try:
                         # Try to decode the input for this batch item
                         input_str = dataset.decode(inp[b].cpu().numpy())
@@ -278,6 +383,7 @@ def evaluate(model, data_loader, criterion, dataset, device, vocab_size, desc="E
                                 actual_length = mask[b].sum().item()
                                 
                                 # Calculate length penalty (quadratic penalty for length difference)
+                                # No penalty if correct length, increasing penalty for longer sequences
                                 if actual_length > expected_length:
                                     item_penalty = 1.0 + 0.5 * ((actual_length - expected_length) / expected_length) ** 2
                                 else:
@@ -288,14 +394,16 @@ def evaluate(model, data_loader, criterion, dataset, device, vocab_size, desc="E
                                 length_penalties.append(1.0)
                         else:
                             length_penalties.append(1.0)
-                    except:
+                    except Exception as e:
+                        # If there's an error processing this batch item, use default penalty
                         length_penalties.append(1.0)
                 
                 # Use the mean length penalty for the batch
                 if length_penalties:
                     length_penalty = sum(length_penalties) / len(length_penalties)
             except Exception as e:
-                print(f"Warning: Error calculating length penalty in evaluation: {e}")
+                # If calculation fails, use default penalty
+                print(f"Warning: Error calculating length penalty: {e}")
                 length_penalty = 1.0
             
             # Apply mask to get per-token losses (excluding padding)
@@ -323,11 +431,73 @@ def evaluate(model, data_loader, criterion, dataset, device, vocab_size, desc="E
     
     return total_loss / max(1, total_samples), sequence_accuracy, digit_accuracy
 
+def signal_handler(sig, frame):
+    """Handle Ctrl+C signal by running efficiency calculation"""
+    print("\nTraining interrupted. Calculating efficiency metrics...")
+    
+    try:
+        # Save current checkpoints (in this process)
+        os.makedirs("checkpoints/simpletransformer", exist_ok=True)
+        os.makedirs("checkpoints/latenttransformer", exist_ok=True)
+        
+        # Run the efficiency calculation directly
+        print("Running efficiency calculation script...")
+        os.system("python calculate_efficiency.py")
+        
+        print("Efficiency calculation complete. Exiting...")
+    except Exception as e:
+        print(f"Error calculating efficiency: {e}")
+    
+    # Always exit this process
+    sys.exit(0)
+
 def train_models_parallel(simple_model, latent_model, train_loader, val_loader, device, config, log_dir, dataset, max_steps=3000, accuracy_weight=0.0, tf_schedule="none", tf_start_step=0):
     """Train both models in parallel for real-time comparison"""
+    # Signal handler is registered in main(), not here
+    
     os.makedirs(log_dir, exist_ok=True)
     simple_writer = SummaryWriter(log_dir=f"{log_dir}/simple")
     latent_writer = SummaryWriter(log_dir=f"{log_dir}/latent")
+    
+    vocab_size = dataset.vocab_size
+    
+    # Optimize models with torch.compile if available (PyTorch 2.0+)
+    try:
+        if hasattr(torch, 'compile') and device.type == 'cuda':
+            print("Using torch.compile to optimize models")
+            simple_model = torch.compile(simple_model)
+            latent_model = torch.compile(latent_model)
+    except Exception as e:
+        print(f"Could not compile models: {e}")
+        
+    # Enable cuDNN benchmarking for optimal performance
+    torch.backends.cudnn.benchmark = True
+    
+    # Create optimizers with appropriate learning rates for each model
+    simple_optimizer = optim.AdamW(simple_model.parameters(), lr=3e-4, weight_decay=0.01)
+    latent_optimizer = optim.AdamW(latent_model.parameters(), lr=3e-4, weight_decay=0.01)
+    
+    # Create LR schedulers with faster ramping and higher peak rates
+    simple_scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer=simple_optimizer,
+        max_lr=5e-4,  # Higher peak learning rate
+        total_steps=max_steps,
+        pct_start=0.03,  # Very fast warmup
+        div_factor=3.0,  # Higher initial lr
+        final_div_factor=10,  # Higher final lr
+    )
+    latent_scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer=latent_optimizer,
+        max_lr=4.5e-4,  # Higher peak learning rate
+        total_steps=max_steps,
+        pct_start=0.03,  # Very fast warmup
+        div_factor=3.0,  # Higher initial lr
+        final_div_factor=10,  # Higher final lr
+    )
+    
+    # Gradient clipping normalization factors
+    GRAD_CLIP_NORM = 3.0  # Higher clip norm for faster updates
+    LATENT_GRAD_CLIP_NORM = 1.5  # Higher but still cautious for latent
     
     # Setup models, criteria, and optimizers
     models = {
@@ -335,59 +505,45 @@ def train_models_parallel(simple_model, latent_model, train_loader, val_loader, 
             "model": simple_model,
             "writer": simple_writer,
             "name": "SimpleTransformer",
-            "criterion": nn.CrossEntropyLoss(ignore_index=0, reduction='none'),  # Changed to 'none' for length penalty
-            "optimizer": optim.AdamW(
-                simple_model.parameters(), 
-                lr=config.base_lr, 
-                weight_decay=config.weight_decay,
-                betas=(0.9, 0.98),
-                eps=1e-8
-            ),
+            "criterion": LabelSmoothingLoss(smoothing=0.1, ignore_index=0, reduction='none'),  # Use same loss as LatentTransformer
+            "optimizer": simple_optimizer,
+            "scheduler": simple_scheduler,
             "best_val_loss": float('inf'),
             "final_loss": float('inf'),
-            "final_sequence_accuracy": 0.0,
-            "final_digit_accuracy": 0.0,
             "step": 0,
-            "params": count_parameters(simple_model),
-            "current_loss": 0.0  # Added for progress bar display
+            "current_loss": 0.0,
+            "recent_losses": [],
+            "stability_window": 100,  # Steps to track for stability
+            "val_loss": float('inf'),
+            "val_sequence_accuracy": 0.0,
+            "val_digit_accuracy": 0.0,
+            "val_accuracy_history": [],  # Track validation accuracies for early stopping
+            "no_improvement_count": 0,  # Counter for early stopping
+            "best_accuracy": 0.0,  # Best validation accuracy
+            "latest_train_accuracy": 0.0  # Added for training accuracy tracking
         },
         "latent": {
             "model": latent_model,
             "writer": latent_writer,
             "name": "LatentTransformer",
-            "criterion": nn.CrossEntropyLoss(ignore_index=0, reduction='none'),  # Changed to 'none' for length penalty
-            "optimizer": optim.AdamW(
-                latent_model.parameters(), 
-                lr=config.base_lr, 
-                weight_decay=config.weight_decay,
-                betas=(0.9, 0.98),
-                eps=1e-8
-            ),
+            "criterion": LabelSmoothingLoss(smoothing=0.1, ignore_index=0, reduction='none'),  # Same smoothing for both models
+            "optimizer": latent_optimizer,
+            "scheduler": latent_scheduler,
             "best_val_loss": float('inf'),
             "final_loss": float('inf'),
-            "final_sequence_accuracy": 0.0,
-            "final_digit_accuracy": 0.0,
             "step": 0,
-            "params": count_parameters(latent_model),
-            "current_loss": 0.0  # Added for progress bar display
+            "current_loss": 0.0,
+            "recent_losses": [],
+            "stability_window": 100,  # Steps to track for stability
+            "val_loss": float('inf'),
+            "val_sequence_accuracy": 0.0,
+            "val_digit_accuracy": 0.0,
+            "val_accuracy_history": [],  # Track validation accuracies for early stopping
+            "no_improvement_count": 0,  # Counter for early stopping
+            "best_accuracy": 0.0,  # Best validation accuracy
+            "latest_train_accuracy": 0.0  # Added for training accuracy tracking
         }
     }
-    
-    # Create schedulers
-    def warmup_cosine_schedule(step):
-        if step < config.warmup_steps:
-            return float(step) / float(max(1, config.warmup_steps))
-        progress = float(step - config.warmup_steps) / float(max(1, max_steps - config.warmup_steps))
-        return max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
-    
-    for model_info in models.values():
-        model_info["scheduler"] = optim.lr_scheduler.LambdaLR(
-            model_info["optimizer"], 
-            lr_lambda=warmup_cosine_schedule
-        )
-    
-    # Get vocab size for loss computation
-    vocab_size = train_loader.dataset.vocab_size
     
     # Time tracking
     start_time = time.time()
@@ -395,16 +551,19 @@ def train_models_parallel(simple_model, latent_model, train_loader, val_loader, 
     # Gradient scalers for mixed precision on CUDA
     if device.type == 'cuda':
         for model_info in models.values():
-            model_info["scaler"] = torch.cuda.amp.GradScaler()
+            model_info["scaler"] = torch.amp.GradScaler()  # Using torch.amp instead of torch.cuda.amp and removing 'cuda' argument
     
     # Generate evaluation examples with lower range for easier evaluation
     try:
-        # Create examples with smaller numbers for easier debugging
-        print("Generating evaluation examples with range 1-5")
-        eval_range = min(5, dataset.max_value)  # Use smaller numbers for evaluation
+        # Define max_val based on min_digits parameter
+        eval_max_val = 999 if args.min_digits >= 3 else (99 if args.min_digits == 2 else 9)
+        print(f"Precomputing val set with range 1-{min(5, eval_max_val)}")
+        eval_range = min(5, eval_max_val)  # Use smaller numbers for initial evaluation
         
         # Create custom examples for easier debugging
         eval_examples = []
+        
+        # Add the simple examples first (for easier debugging)
         for a in range(1, eval_range + 1):
             for b in range(1, eval_range + 1):
                 # Format input
@@ -418,16 +577,66 @@ def train_models_parallel(simple_model, latent_model, train_loader, val_loader, 
                 
                 eval_examples.append((input_tensor, result_str, a, b))
                 
-                # Limit to 20 examples
-                if len(eval_examples) >= 20:
+                # Limit to 10 simple examples
+                if len(eval_examples) >= 10:
                     break
-            if len(eval_examples) >= 20:
+            if len(eval_examples) >= 10:
+                break
+        
+        # Add more complex examples to better represent the true distribution
+        ranges = []
+        if args.min_digits >= 2:
+            ranges.extend([(10, 20), (20, 50)])
+        if args.min_digits >= 3:
+            ranges.extend([(50, 100), (100, 200)])
+            
+        for min_r, max_r in ranges:
+            for _ in range(4):  # 4 examples from each range
+                a = random.randint(min_r, max_r)
+                b = random.randint(min_r, max_r)
+                
+                # Format input
+                input_str = f"{a}*{b}"
+                input_tokens = dataset.encode(input_str)
+                input_tensor = torch.tensor([input_tokens], dtype=torch.long).to(device)
+                
+                # Format expected output
+                result = a * b
+                result_str = str(result)
+                
+                eval_examples.append((input_tensor, result_str, a, b))
+                
+                # Limit to 30 total examples
+                if len(eval_examples) >= 30:
+                    break
+            if len(eval_examples) >= 30:
                 break
                 
         print(f"Created {len(eval_examples)} evaluation examples")
+        
+        # Ensure we have at least some examples
+        if not eval_examples:
+            print("Warning: No evaluation examples created, adding fallback examples")
+            # Add some basic fallback examples
+            for a, b in [(2, 3), (4, 5), (3, 7)]:
+                input_str = f"{a}*{b}"
+                input_tokens = dataset.encode(input_str)
+                input_tensor = torch.tensor([input_tokens], dtype=torch.long).to(device)
+                result = a * b
+                result_str = str(result)
+                eval_examples.append((input_tensor, result_str, a, b))
     except Exception as e:
         print(f"Error generating evaluation examples: {e}")
+        print("Adding fallback examples")
+        # Add some basic fallback examples
         eval_examples = []
+        for a, b in [(2, 3), (4, 5), (3, 7)]:
+            input_str = f"{a}*{b}"
+            input_tokens = dataset.encode(input_str)
+            input_tensor = torch.tensor([input_tokens], dtype=torch.long).to(device)
+            result = a * b
+            result_str = str(result)
+            eval_examples.append((input_tensor, result_str, a, b))
     
     # Main training loop
     global_step = 0
@@ -531,8 +740,27 @@ def train_models_parallel(simple_model, latent_model, train_loader, val_loader, 
                 
                 if device.type == 'cuda':
                     # Use mixed precision for faster training on GPU
-                    with torch.cuda.amp.autocast():
+                    with torch.amp.autocast(device_type='cuda'):
                         output = model(inp, decoder_input)
+                        
+                        # Validate output shape matches target shape to prevent batch size mismatches
+                        if output.size(0) != decoder_target.size(0) or output.size(1) != decoder_target.size(1):
+                            print(f"Warning: Shape mismatch for {model_info['name']} at step {model_info['step']}")
+                            print(f"Output shape: {output.shape}, Target shape: {decoder_target.shape}")
+                            
+                            # Try to slice the larger tensor to match the smaller one's batch size
+                            min_batch = min(output.size(0), decoder_target.size(0))
+                            min_seq_len = min(output.size(1), decoder_target.size(1))
+                            
+                            output = output[:min_batch, :min_seq_len, :]
+                            decoder_target = decoder_target[:min_batch, :min_seq_len]
+                            
+                            print(f"Resized shapes - Output: {output.shape}, Target: {decoder_target.shape}")
+                            
+                            # If shapes still don't align properly, skip this batch
+                            if output.size(0) != decoder_target.size(0) or output.size(1) != decoder_target.size(1):
+                                print(f"Cannot reconcile shapes, skipping batch")
+                                continue
                         
                         # Calculate base loss (per token)
                         token_losses = criterion(output.reshape(-1, vocab_size), decoder_target.reshape(-1))
@@ -551,30 +779,35 @@ def train_models_parallel(simple_model, latent_model, train_loader, val_loader, 
                             batch_size = inp.size(0)
                             length_penalties = []
                             
-                            for b in range(batch_size):
-                                # Try to decode the input for this batch item
-                                input_str = dataset.decode(inp[b].cpu().numpy())
-                                if '*' in input_str:
-                                    parts = input_str.split('*')
-                                    if len(parts) == 2:
-                                        # Calculate expected result length
-                                        a, b = int(parts[0]), int(parts[1])
-                                        expected_length = len(str(a * b))
-                                        
-                                        # Get actual output length for this batch item
-                                        actual_length = mask[b].sum().item()
-                                        
-                                        # Calculate length penalty (quadratic penalty for length difference)
-                                        # No penalty if correct length, increasing penalty for longer sequences
-                                        if actual_length > expected_length:
-                                            item_penalty = 1.0 + 0.5 * ((actual_length - expected_length) / expected_length) ** 2
+                            # Ensure we only access valid indices within the batch
+                            for b in range(min(batch_size, inp.size(0))):
+                                try:
+                                    # Try to decode the input for this batch item
+                                    input_str = dataset.decode(inp[b].cpu().numpy())
+                                    if '*' in input_str:
+                                        parts = input_str.split('*')
+                                        if len(parts) == 2:
+                                            # Calculate expected result length
+                                            a, b = int(parts[0]), int(parts[1])
+                                            expected_length = len(str(a * b))
+                                            
+                                            # Get actual output length for this batch item
+                                            actual_length = mask[b].sum().item()
+                                            
+                                            # Calculate length penalty (quadratic penalty for length difference)
+                                            # No penalty if correct length, increasing penalty for longer sequences
+                                            if actual_length > expected_length:
+                                                item_penalty = 1.0 + 0.5 * ((actual_length - expected_length) / expected_length) ** 2
+                                            else:
+                                                item_penalty = 1.0
+                                            
+                                            length_penalties.append(item_penalty)
                                         else:
-                                            item_penalty = 1.0
-                                        
-                                        length_penalties.append(item_penalty)
+                                            length_penalties.append(1.0)
                                     else:
                                         length_penalties.append(1.0)
-                                else:
+                                except Exception as e:
+                                    # If there's an error processing this batch item, use default penalty
                                     length_penalties.append(1.0)
                             
                             # Use the mean length penalty for the batch
@@ -649,16 +882,42 @@ def train_models_parallel(simple_model, latent_model, train_loader, val_loader, 
                             writer.add_scalar('train/ce_loss', original_loss.item(), model_info["step"])
                             writer.add_scalar('train/modified_loss', loss.item(), model_info["step"])
                             
+                            # Log number of completely correct predictions as percentage
+                            num_correct = sequence_correct.sum().item()
+                            total_examples = sequence_correct.size(0)
+                            percent_correct = (num_correct / total_examples) * 100
+                            writer.add_scalar('train/percent_correct_predictions', percent_correct, model_info["step"])
+                            writer.add_scalar('train/num_correct_predictions', num_correct, model_info["step"])
+                            writer.add_scalar('train/batch_size', total_examples, model_info["step"])
+                        
                         # Log length penalty
                         writer.add_scalar('train/length_penalty', length_penalty, model_info["step"])
                     
                     # Scale gradients
                     scaler = model_info["scaler"]
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
-                    scaler.step(optimizer)
-                    scaler.update()
+                    if scaler is not None:
+                        scaler.scale(loss).backward()
+                        
+                        # Unscale gradients before clipping
+                        scaler.unscale_(optimizer)
+                        
+                        # Apply gradient clipping
+                        if model_type == "latent":
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), LATENT_GRAD_CLIP_NORM)  # More aggressive for latent
+                        else:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)  # Standard clipping
+                            
+                        # Perform optimizer step and scaler update
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        loss.backward()
+                        # Clip gradients even more aggressively for latent model after step 4000
+                        if model_type == "latent" and model_info["step"] > 4000:
+                            nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM * LATENT_GRAD_CLIP_NORM)
+                        else:
+                            nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
+                        optimizer.step()
                 else:
                     # Standard training for CPU/MPS
                     output = model(inp, decoder_input)
@@ -667,6 +926,25 @@ def train_models_parallel(simple_model, latent_model, train_loader, val_loader, 
                     if torch.isnan(output).any():
                         print(f"Warning: NaN in output for {model_info['name']} at step {model_info['step']}, skipping batch.")
                         continue
+                    
+                    # Validate output shape matches target shape to prevent batch size mismatches
+                    if output.size(0) != decoder_target.size(0) or output.size(1) != decoder_target.size(1):
+                        print(f"Warning: Shape mismatch for {model_info['name']} at step {model_info['step']}")
+                        print(f"Output shape: {output.shape}, Target shape: {decoder_target.shape}")
+                        
+                        # Try to slice the larger tensor to match the smaller one's batch size
+                        min_batch = min(output.size(0), decoder_target.size(0))
+                        min_seq_len = min(output.size(1), decoder_target.size(1))
+                        
+                        output = output[:min_batch, :min_seq_len, :]
+                        decoder_target = decoder_target[:min_batch, :min_seq_len]
+                        
+                        print(f"Resized shapes - Output: {output.shape}, Target: {decoder_target.shape}")
+                        
+                        # If shapes still don't align properly, skip this batch
+                        if output.size(0) != decoder_target.size(0) or output.size(1) != decoder_target.size(1):
+                            print(f"Cannot reconcile shapes, skipping batch")
+                            continue
                     
                     # Calculate base loss (per token)
                     token_losses = criterion(output.reshape(-1, vocab_size), decoder_target.reshape(-1))
@@ -685,30 +963,35 @@ def train_models_parallel(simple_model, latent_model, train_loader, val_loader, 
                         batch_size = inp.size(0)
                         length_penalties = []
                         
-                        for b in range(batch_size):
-                            # Try to decode the input for this batch item
-                            input_str = dataset.decode(inp[b].cpu().numpy())
-                            if '*' in input_str:
-                                parts = input_str.split('*')
-                                if len(parts) == 2:
-                                    # Calculate expected result length
-                                    a, b = int(parts[0]), int(parts[1])
-                                    expected_length = len(str(a * b))
-                                    
-                                    # Get actual output length for this batch item
-                                    actual_length = mask[b].sum().item()
-                                    
-                                    # Calculate length penalty (quadratic penalty for length difference)
-                                    # No penalty if correct length, increasing penalty for longer sequences
-                                    if actual_length > expected_length:
-                                        item_penalty = 1.0 + 0.5 * ((actual_length - expected_length) / expected_length) ** 2
+                        # Ensure we only access valid indices within the batch
+                        for b in range(min(batch_size, inp.size(0))):
+                            try:
+                                # Try to decode the input for this batch item
+                                input_str = dataset.decode(inp[b].cpu().numpy())
+                                if '*' in input_str:
+                                    parts = input_str.split('*')
+                                    if len(parts) == 2:
+                                        # Calculate expected result length
+                                        a, b = int(parts[0]), int(parts[1])
+                                        expected_length = len(str(a * b))
+                                        
+                                        # Get actual output length for this batch item
+                                        actual_length = mask[b].sum().item()
+                                        
+                                        # Calculate length penalty (quadratic penalty for length difference)
+                                        # No penalty if correct length, increasing penalty for longer sequences
+                                        if actual_length > expected_length:
+                                            item_penalty = 1.0 + 0.5 * ((actual_length - expected_length) / expected_length) ** 2
+                                        else:
+                                            item_penalty = 1.0
+                                        
+                                        length_penalties.append(item_penalty)
                                     else:
-                                        item_penalty = 1.0
-                                    
-                                    length_penalties.append(item_penalty)
+                                        length_penalties.append(1.0)
                                 else:
                                     length_penalties.append(1.0)
-                            else:
+                            except Exception as e:
+                                # If there's an error processing this batch item, use default penalty
                                 length_penalties.append(1.0)
                         
                         # Use the mean length penalty for the batch
@@ -806,25 +1089,69 @@ def train_models_parallel(simple_model, latent_model, train_loader, val_loader, 
                         optimizer.zero_grad()
                         continue
                     
-                    # Clip gradients to prevent explosions
-                    nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+                    # Apply gradient clipping to prevent explosions
+                    if model_type == "latent":
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), LATENT_GRAD_CLIP_NORM)  # More aggressive for latent
+                    else:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)  # Standard clipping
                     optimizer.step()
                 
                 model_info["scheduler"].step()
                 
-                # Log metrics
-                lr = model_info["scheduler"].get_last_lr()[0]
-                writer.add_scalar('train/loss', loss.item(), model_info["step"])
-                writer.add_scalar('train/lr', lr, model_info["step"])
+                # Calculate training metrics for this batch
+                with torch.no_grad():
+                    # Save the training accuracy for overfitting detection
+                    model_info["latest_train_accuracy"] = sequence_accuracy  # Store for later use
+                    
+                    # Log to TensorBoard
+                    writer.add_scalar('train/loss', loss.item(), model_info["step"])
+                    writer.add_scalar('train/ce_loss', loss.item(), model_info["step"])
+                    writer.add_scalar('train/modified_loss', loss.item(), model_info["step"])
+                    writer.add_scalar('train/lr', model_info["scheduler"].get_last_lr()[0], model_info["step"])
+                    writer.add_scalar('train/tf_probability', tf_prob, model_info["step"])
+                    writer.add_scalar('train/length_penalty', length_penalty, model_info["step"])
+                    writer.add_scalar('train/token_accuracy', batch_accuracy, model_info["step"])
+                    writer.add_scalar('train/sequence_accuracy', sequence_accuracy, model_info["step"])
                 
-                # Store current loss for display in progress bar
-                model_info["current_loss"] = loss.item()
+                # Track recent losses to detect training instability
+                model_info["recent_losses"].append(loss.item())
+                if len(model_info["recent_losses"]) > model_info["stability_window"]:
+                    model_info["recent_losses"].pop(0)
+                
+                # Detect if loss is consistently increasing and reset if needed
+                if len(model_info["recent_losses"]) >= 20 and model_info["step"] >= 3500:
+                    recent_trend = sum(model_info["recent_losses"][-5:]) / 5 - sum(model_info["recent_losses"][-20:-15]) / 5
+                    
+                    # If loss is trending upward significantly
+                    if recent_trend > 0.05:
+                        model_info["no_improvement_count"] += 1
+                        
+                        # Apply recovery after consecutive detections of increasing loss
+                        if model_info["no_improvement_count"] >= 3 and model_type == "latent":
+                            print(f"\n⚠️ Detected loss increase trend in {model_type} model. Applying recovery...")
+                            
+                            # 1. Reduce learning rate by half
+                            for param_group in optimizer.param_groups:
+                                param_group['lr'] = param_group['lr'] * 0.5
+                                
+                            # 2. Log the intervention
+                            writer.add_scalar('train/lr_reset', optimizer.param_groups[0]['lr'], model_info["step"])
+                            print(f"   - Reduced learning rate to {optimizer.param_groups[0]['lr']}")
+                            
+                            # 3. Reset counter
+                            model_info["no_improvement_count"] = 0
+                    else:
+                        model_info["no_improvement_count"] = 0
                 
                 # Increment step
                 model_info["step"] += 1
                 
                 # Validate periodically
                 if model_info["step"] > 0 and model_info["step"] % val_freq == 0:
+                    # Determine if we should rotate validation examples
+                    # Start rotating after some training to test generalization
+                    rotate_examples = model_info["step"] > 3000 and model_info["step"] % (val_freq * 4) == 0
+                    
                     val_loss, val_sequence_accuracy, val_digit_accuracy = evaluate(
                         model=model,
                         data_loader=val_loader,
@@ -833,12 +1160,86 @@ def train_models_parallel(simple_model, latent_model, train_loader, val_loader, 
                         device=device,
                         vocab_size=vocab_size,
                         desc=f"Val {model_info['name']}",
-                        examples=eval_examples
+                        examples=eval_examples,
+                        rotate_examples=rotate_examples
                     )
                     
+                    if rotate_examples:
+                        writer.add_scalar('val/generalization_accuracy', val_sequence_accuracy, model_info["step"])
+                        print(f"   Testing generalization with modified examples: {val_sequence_accuracy:.2%} accuracy")
+                    
+                    # Store validation metrics for later use
+                    model_info["val_loss"] = val_loss
+                    model_info["val_sequence_accuracy"] = val_sequence_accuracy
+                    model_info["val_digit_accuracy"] = val_digit_accuracy
+                    
+                    # Always save the latest model checkpoint for efficiency calculation
+                    model_checkpoint_dir = f"checkpoints/{model_info['name'].lower()}"
+                    os.makedirs(model_checkpoint_dir, exist_ok=True)
+                    torch.save({
+                        'model_state_dict': model.state_dict(),
+                        'val_loss': val_loss,
+                        'val_sequence_accuracy': val_sequence_accuracy,
+                    }, f"{model_checkpoint_dir}/{model_info['name'].lower()}_best.pt")
+                    
+                    # Log validation metrics
                     writer.add_scalar('val/loss', val_loss, model_info["step"])
                     writer.add_scalar('val/sequence_accuracy', val_sequence_accuracy, model_info["step"])
                     writer.add_scalar('val/digit_accuracy', val_digit_accuracy, model_info["step"])
+                    
+                    # Log number of completely correct predictions in validation as percentage
+                    val_correct = int(val_sequence_accuracy * len(eval_examples))
+                    val_percent_correct = (val_correct / len(eval_examples)) * 100
+                    writer.add_scalar('val/percent_correct_predictions', val_percent_correct, model_info["step"])
+                    writer.add_scalar('val/num_correct_predictions', val_correct, model_info["step"])
+                    writer.add_scalar('val/total_examples', len(eval_examples), model_info["step"])
+                    
+                    # Track validation accuracy history for early stopping
+                    model_info["val_accuracy_history"].append(val_sequence_accuracy)
+                    if len(model_info["val_accuracy_history"]) > 10:  # Keep last 10 validation results
+                        model_info["val_accuracy_history"].pop(0)
+                    
+                    # Implement early stopping based on validation accuracy
+                    if val_sequence_accuracy > model_info["best_accuracy"]:
+                        model_info["best_accuracy"] = val_sequence_accuracy
+                        model_info["no_improvement_count"] = 0
+                    else:
+                        model_info["no_improvement_count"] += 1
+                        
+                        # If no improvement for 5 consecutive validations, and gap between train and val is large
+                        if model_info["no_improvement_count"] >= 5 and model_info["step"] > 1000:
+                            # Check if there's a large gap between train and val accuracy (overfitting)
+                            # We need to track training accuracy manually since we can't access writer's internal data
+                            train_acc = model_info["latest_train_accuracy"]
+                            
+                            gap = train_acc - val_sequence_accuracy
+                            writer.add_scalar('overfitting/train_val_gap', gap, model_info["step"])
+                            
+                            if gap > 0.3:  # 30% gap
+                                print(f"\n⚠️ Overfitting detected for {model_info['name']}! Train acc: {train_acc:.2%}, Val acc: {val_sequence_accuracy:.2%}")
+                                
+                                # Apply remedies
+                                print(f"   - Reducing learning rate and increasing regularization")
+                                for param_group in optimizer.param_groups:
+                                    param_group['lr'] = param_group['lr'] * 0.5
+                                    param_group['weight_decay'] = param_group['weight_decay'] * 1.5
+                                
+                                # For the latent model, try more aggressive regularization
+                                if model_type == "latent":
+                                    # Increase dropout on the fly (by patching the model's modules)
+                                    for module in model.modules():
+                                        if isinstance(module, nn.Dropout):
+                                            # Increase dropout probability by 50%
+                                            module.p = min(0.5, module.p * 1.5)
+                                    
+                                    print(f"   - Increased dropout for {model_info['name']}")
+                                
+                                # Log intervention
+                                writer.add_scalar('train/lr_reset_overfitting', optimizer.param_groups[0]['lr'], model_info["step"])
+                                
+                                # Reset counter
+                                model_info["no_improvement_count"] = 0
+                    
                     print(f"\n{model_info['name']} - Step {model_info['step']}/{max_steps} - Val Loss: {val_loss:.6f} - Sequence Acc: {val_sequence_accuracy:.2%} - Digit Acc: {val_digit_accuracy:.2%}")
                     
                     # Save best model
@@ -853,6 +1254,13 @@ def train_models_parallel(simple_model, latent_model, train_loader, val_loader, 
                             'val_sequence_accuracy': val_sequence_accuracy,
                             'val_digit_accuracy': val_digit_accuracy,
                         }, f"checkpoints/{model_info['name'].lower()}/{model_info['name'].lower()}_best.pt")
+                        
+                        # Also save as latest for the signal handler
+                        torch.save({
+                            'model_state_dict': model.state_dict(),
+                            'val_loss': val_loss,
+                            'val_sequence_accuracy': val_sequence_accuracy,
+                        }, f"checkpoints/{model_info['name'].lower()}_latest.pt")
                     
                     # Return to training mode
                     model.train()
@@ -928,18 +1336,29 @@ def train_models_parallel(simple_model, latent_model, train_loader, val_loader, 
     }
 
 def main():
+    # Signal handler is now registered only once here
+    signal.signal(signal.SIGINT, signal_handler)
+    
     # Enable MPS fallback
     os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
     
+    # Enable TF32 on Ampere GPUs for faster training with minimal precision loss
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    
+    # Default to mixed precision for training speed
+    torch.set_float32_matmul_precision('high')
+    
     # Parse arguments
     parser = argparse.ArgumentParser(description="Parallel comparison of transformer architectures with device selection")
-    parser.add_argument("--d-model", type=int, default=32, help="Model dimension (default: 32)")
-    parser.add_argument("--num-layers", type=int, default=2, help="Number of layers (default: 2)")
-    parser.add_argument("--num-latent", type=int, default=4, help="Number of latent tokens (default: 4)")
-    parser.add_argument("--bottleneck-factor", type=float, default=1.0, help="Bottleneck factor (default: 1.0)")
+    parser.add_argument("--d-model", type=int, default=512, help="Model dimension (default: 512)")
+    parser.add_argument("--num-layers", type=int, default=6, help="Number of transformer layers (default: 6)")
+    parser.add_argument("--num-latent", type=int, default=32, help="Number of latent tokens (default: 32 for 3-digit multiplication)")
+    parser.add_argument("--bottleneck-factor", type=float, default=0.5, help="Bottleneck strength factor")
     parser.add_argument("--max-steps", type=int, default=500, help="Maximum training steps (default: 500)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
-    parser.add_argument("--min-digits", type=int, default=1, help="Minimum number of digits (default: 1)")
+    parser.add_argument("--min-digits", type=int, default=1, choices=[1, 2, 3], 
+                        help="Minimum number of digits: 1=single digits (1-9), 2=double digits (10-99), 3=triple digits (100-999) (default: 1)")
     parser.add_argument("--device", type=str, default="auto", 
                         help="Device to use: 'cuda', 'mps', 'cpu', or 'auto' (default: auto-detect)")
     parser.add_argument("--accuracy-weight", type=float, default=0.5,
@@ -948,6 +1367,8 @@ def main():
                         help="Teacher forcing schedule: none=always use, linear=linearly decrease, exp=exponentially decrease (default: linear)")
     parser.add_argument("--tf-start-step", type=int, default=200,
                         help="Step at which to start scheduled teacher forcing (default: 200 - pure teacher forcing for first 200 steps)")
+    parser.add_argument("--use-checkpointing", action="store_true", 
+                        help="Use gradient checkpointing to reduce memory usage and improve stability")
     args = parser.parse_args()
     
     # Set seed for reproducibility
@@ -956,11 +1377,11 @@ def main():
     # Load configuration
     config = TrainingConfig()
     
-    # Override config for stability
+    # Override config for stability and to reduce overfitting
     config.base_lr = 3e-4  # Standard learning rate
-    config.max_grad_norm = 1.0  # Standard gradient clipping
-    config.warmup_steps = 100  # Warmup period
-    config.weight_decay = 0.01  # Regularization
+    config.max_grad_norm = 0.5  # Reduced gradient clipping for stability
+    config.warmup_steps = 200  # Extended warmup period
+    config.weight_decay = 0.025  # Increased weight decay to fight overfitting
     
     # Setup device based on arguments or auto-detect
     if args.device == "auto":
@@ -989,37 +1410,46 @@ def main():
     
     # Create datasets
     min_val = 10 if args.min_digits >= 2 else 1
-    max_val = 99 if args.min_digits == 2 else (9 if args.min_digits == 1 else 999)
+    max_val = 999 if args.min_digits >= 3 else (99 if args.min_digits == 2 else 9)
     
+    print(f"Using train dataset with range {min_val}-{max_val}")
     train_dataset = MultiplicationDataset(
-        num_samples=8000,
+        num_samples=20000,  # Increased dataset size further
         split='train',
         split_ratio=(0.8, 0.1, 0.1),
         min_value=min_val,
         max_value=max_val
     )
     
+    print(f"Using val dataset with range {min_val}-{max_val}")
     val_dataset = MultiplicationDataset(
-        num_samples=1000,
+        num_samples=2000,  # Increased validation set
         split='val',
         split_ratio=(0.8, 0.1, 0.1),
         min_value=min_val,
         max_value=max_val
     )
     
-    # Create data loaders
+    # Create data loaders with larger batch size to fully utilize GPU
     train_loader = DataLoader(
         train_dataset,
-        batch_size=64,  # Standard batch size
+        batch_size=512,  # Increased from 256 to better utilize GPU memory
         shuffle=True,
-        collate_fn=collate_fn
+        collate_fn=collate_fn,
+        num_workers=8,  # More workers for faster data loading
+        pin_memory=True,
+        persistent_workers=True,  # Keep workers alive between batches
+        prefetch_factor=3  # Prefetch more batches
     )
     
     val_loader = DataLoader(
         val_dataset,
-        batch_size=64,
+        batch_size=512,  # Increased to match training batch size
         shuffle=False,
-        collate_fn=collate_fn
+        collate_fn=collate_fn,
+        num_workers=8,  # More workers for faster data loading
+        pin_memory=True,
+        persistent_workers=True  # Keep workers alive between batches
     )
     
     # Initialize models
@@ -1031,33 +1461,47 @@ def main():
     simple_transformer = StableSimpleTransformer(
         vocab_size=train_dataset.vocab_size,
         d_model=d_model,
-        nhead=4,
+        nhead=8,
         num_layers=num_layers,
         dropout=0.1
     ).to(device)
     
-    # Create LatentTransformer (stable version)
+    # For 3-digit multiplication, we need more latent tokens
+    # For d_model=512, num_layers=6:
+    # - SimpleTransformer: ~44 million parameters
+    # - For similar parameter counts with num_latent=32: ~49 million parameters
     latent_transformer = StableLatentTransformer(
         vocab_size=train_dataset.vocab_size,
         d_model=d_model,
-        nhead=4,
+        nhead=8,
         num_layers=num_layers,
-        num_latent=num_latent,
+        num_latent=num_latent,  # Increased to handle 3-digit complexity
         dropout=0.1,
-        bottleneck_factor=args.bottleneck_factor
+        bottleneck_factor=1.0  # Standard bottleneck constraint
     ).to(device)
     
-    # Print parameter counts
-    simple_params = count_parameters(simple_transformer)
-    latent_params = count_parameters(latent_transformer)
+    # Enable gradient checkpointing for memory efficiency
+    if args.use_checkpointing and device.type == 'cuda':
+        print("Enabling gradient checkpointing for memory efficiency")
+        simple_transformer.encoder.layers.apply(lambda m: setattr(m, '_checkpoint', True) if hasattr(m, '_checkpoint') else None)
+        simple_transformer.decoder.layers.apply(lambda m: setattr(m, '_checkpoint', True) if hasattr(m, '_checkpoint') else None)
+        latent_transformer.encoder.layers.apply(lambda m: setattr(m, '_checkpoint', True) if hasattr(m, '_checkpoint') else None)
+        latent_transformer.decoder.layers.apply(lambda m: setattr(m, '_checkpoint', True) if hasattr(m, '_checkpoint') else None)
     
-    print(f"SimpleTransformer parameters: {simple_params:,}")
-    print(f"LatentTransformer parameters: {latent_params:,}")
+    # Print parameter counts to help with comparison
+    simple_params = sum(p.numel() for p in simple_transformer.parameters())
+    latent_params = sum(p.numel() for p in latent_transformer.parameters())
+    print(f"\nModel Parameters:")
+    print(f"SimpleTransformer: {simple_params:,}")
+    print(f"LatentTransformer: {latent_params:,}")
     print(f"Parameter ratio: {latent_params/simple_params:.2f}x")
+    print(f"Difference: {latent_params-simple_params:,} parameters ({((latent_params-simple_params)/simple_params)*100:.1f}%)")
+    print()
     
     # Train both models in parallel
     print("\nTraining both models in parallel...")
-    log_dir = f"runs/parallel_comparison/d{d_model}_l{num_layers}_n{num_latent}"
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    log_dir = f"runs/parallel_comparison/{timestamp}_d{d_model}_l{num_layers}_n{num_latent}"
     
     # Delete existing runs directory if it exists to avoid TensorBoard confusion
     if os.path.exists(log_dir):
