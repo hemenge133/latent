@@ -1,35 +1,39 @@
-# Transformer Architecture Comparison
+# Latent Transformer vs. Simple Transformer
 
 This project compares two transformer architectures for sequence-to-sequence tasks, with a focus on the multiplication task:
 
 1. **SimpleTransformer**: A standard encoder-decoder transformer architecture.
 2. **LatentTransformer**: A modified architecture with a latent bottleneck between encoder and decoder.
 
+## Architecture Comparison
+
+The key concept being tested is whether a latent bottleneck can provide advantages in terms of:
+- Parameter efficiency
+- Generalization ability
+- Computational performance
+
+### SimpleTransformer
+- Standard encoder-decoder transformer architecture
+- Direct attention from decoder to encoder memory
+- Parameter count scales with input sequence length
+
+### LatentTransformer
+- Uses a fixed set of latent tokens as an information bottleneck
+- The latent tokens function as an "abstract thought" layer
+- Forces the model to compress information before decoding
+- Parameter count grows less with input sequence length
+- Potentially better generalization from the compression effect
+
 ## Project Structure
 
-- `Transformer.py`: Contains implementations of both transformer architectures
+The codebase has been streamlined to focus on the core comparison:
+
+- `parallel_comparison.py`: Main training script to compare both models simultaneously
+- `calculate_efficiency.py`: Script to calculate efficiency metrics between models
+- `stable_comparison_with_accuracy.py`: Contains stable implementations of both architectures
 - `Dataset.py`: Implementation of the multiplication dataset
-- `Collate.py`: Collation function for batch processing
+- `utils.py`: Utility functions including collation and evaluation
 - `config.py`: Configuration parameters for training
-
-### Comparison Scripts
-
-- `fair_comparison.py`: Script for comparing both architectures with fair parameter settings
-- `stable_comparison.py`: More numerically stable version of the comparison script 
-- `inference_comparison.py`: Script for comparing inference results without training
-- `transformer_comparison_results.md`: Summary of findings and recommendations
-
-## Main Architectural Differences
-
-1. **SimpleTransformer**:
-   - Standard encoder-decoder transformer architecture
-   - Direct attention from decoder to encoder memory
-   - Parameter count scales linearly with input sequence length
-
-2. **LatentTransformer**:
-   - Uses a fixed set of latent tokens as an information bottleneck
-   - Decoder only attends to latent tokens, not full encoder memory
-   - Parameter count is less dependent on input sequence length
 
 ## Running the Comparison
 
@@ -37,53 +41,60 @@ This project compares two transformer architectures for sequence-to-sequence tas
 
 - Python 3.10 or higher
 - PyTorch 2.0 or higher
-- NumPy
-- tqdm
+- CUDA-capable GPU recommended
 
-### Basic Usage
-
-For a basic comparison:
+### Installation
 
 ```bash
-python fair_comparison.py --d-model 128 --num-layers 3 --num-latent 8
+pip install -r requirements.txt
 ```
 
-For improved stability:
+### Running Training
+
+For 3-digit multiplication with 512-dimensional models and 32 latent tokens:
 
 ```bash
-python stable_comparison.py --d-model 32 --num-layers 2 --num-latent 4 --max-steps 500
+python parallel_comparison.py --d-model 512 --num-layers 6 --num-latent 32 --max-steps 100000 --min-digits 3 --device cuda --use-checkpointing
 ```
 
-To compare inference without training:
+For 1-digit multiplication (faster for testing):
 
 ```bash
-python inference_comparison.py --use-dummy-weights
+python parallel_comparison.py --d-model 128 --num-layers 4 --num-latent 8 --max-steps 10000 --min-digits 1 --device cuda
 ```
 
-Using pre-trained models (if available):
+### Calculating Efficiency
+
+After training or when interrupted with Ctrl+C:
 
 ```bash
-python inference_comparison.py --simple-checkpoint=checkpoints/simple/best.pt --latent-checkpoint=checkpoints/latent/best.pt
+python calculate_efficiency.py
 ```
 
-## Key Findings
+## Features
 
-The theoretical advantages of the LatentTransformer include:
+- **Parallel Training**: Both models trained simultaneously for fair comparison
+- **TensorBoard Integration**: Comprehensive metrics tracking including:
+  - Loss curves
+  - Learning rates
+  - Percentage of completely correct predictions
+  - Generalization accuracy
+- **Ctrl+C Handling**: Gracefully calculates efficiency metrics when interrupted
+- **Stable Implementation**: Numerical stability enhancements for reliable training
+- **Checkpoint Management**: Automatically saves best model checkpoints
 
-- Fixed computational cost for decoder regardless of input length
-- Information distillation through latent tokens
-- Reduced memory requirements for long sequences
+## Experiment Results
 
-However, practical challenges were encountered:
+The effectiveness of the latent bottleneck varies by task complexity:
 
-- Both models showed numerical stability issues
-- MPS backend limitations affected transformer operations on Apple Silicon
-- The additional complexity of LatentTransformer may not be justified for simpler tasks
+- For simple tasks (1-digit multiplication), SimpleTransformer often converges faster
+- For complex tasks (3-digit multiplication), LatentTransformer can show parameter efficiency advantages
+- The number of latent tokens significantly impacts model performance on complex tasks
 
-For detailed findings, see the [comparison results](transformer_comparison_results.md).
+## Viewing Results
 
-## Future Work
+```bash
+tensorboard --logdir=runs
+```
 
-- Evaluate on more stable hardware (CUDA GPU)
-- Conduct proper hyperparameter tuning once stability issues are resolved
-- Experiment with longer sequence tasks where LatentTransformer might show stronger advantages 
+This will show training curves and metrics for both models, allowing side-by-side comparison. 
