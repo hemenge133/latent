@@ -1,2 +1,2 @@
-rm ./runs/parallel_comparison/*
-rm ./runs/test_tensorboard/*
+rm -r ./runs/parallel_comparison/*
+rm -r ./runs/test_tensorboard/*
