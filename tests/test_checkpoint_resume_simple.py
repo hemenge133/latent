@@ -149,7 +149,7 @@ def test_checkpoint_resume_simple():
             "--min-digits", "1",            # Single-digit multiplication (small problem)
             "--max-digits", "1",
             "--batch-size", "16",           # Small batch size
-            "--max-steps", str(initial_step + 10),    # Just 10 steps (~ 3 epochs with small dataset)
+            "--max-steps", "10",            # Fixed value: Just 10 steps (~ 3 epochs with small dataset)
             "--save-every", "3",            # Save every 3 steps to ensure checkpoint at end
             "--seed", "42"
         ]
@@ -194,17 +194,17 @@ def test_checkpoint_resume_simple():
         # Step 2: Resume training for 3 more epochs
         resume_cmd = [
             "python", "main.py",
-            "--max-steps", str(simple_step + 10),  # 10 more steps
+            "--max-steps", "20",            # Fixed value: Run to 20 steps total
             "--seed", "42"
         ]
         
         # Add resume flag and run ID if available
         if initial_run_id:
-            resume_cmd.insert(1, "--resume")
+            resume_cmd.insert(2, "--resume")
             resume_cmd.extend(["--run-id", initial_run_id])
         else:
             # Just use resume flag without run ID
-            resume_cmd.insert(1, "--resume")
+            resume_cmd.insert(2, "--resume")
             # Add parameters from the initial run to ensure compatibility
             resume_cmd.extend([
                 "--d-model", "32",
