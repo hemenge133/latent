@@ -4,7 +4,7 @@ __pycache__/
 *$py.class
 *.pt
 runs/
-.log
+*.log
 checkpoitns/
 
 # C extensions
