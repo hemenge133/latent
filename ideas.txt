@@ -1,0 +1,2 @@
+Enhance the dataset by adding in floating points and generate at least 10GB of long 32 bit floating point values that will store nicely on cuda cores.
+
