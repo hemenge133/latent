@@ -99,6 +99,88 @@ def check_model_dimensions(checkpoint, d_model):
     return True, d_model
 
 
+def extract_model_dimensions(checkpoint):
+    """
+    Extract important model dimensions from a checkpoint file.
+    This is used to ensure that models are created with the correct dimensions
+    when loading from checkpoints, regardless of command-line defaults.
+    """
+    dimensions = {
+        'd_model': None,       # Will be set later if detected
+        'num_layers': None,    # Will be set later if detected
+        'vocab_size': None,    # Will be set later if detected
+        'num_latent': None,    # Will be set later if detected (latent models only)
+        'max_len': 20          # Default max sequence length
+    }
+    
+    # Determine if we have a model_state_dict or direct state dict
+    if 'model_state_dict' in checkpoint:
+        state_dict = checkpoint['model_state_dict']
+    else:
+        state_dict = checkpoint
+    
+    # Look for config in the checkpoint first
+    if 'config' in checkpoint:
+        config = checkpoint['config']
+        # Get d_model from config
+        if 'd_model' in config:
+            dimensions['d_model'] = config['d_model']
+        
+        # Get num_layers from config
+        if 'num_layers' in config:
+            dimensions['num_layers'] = config['num_layers']
+            
+        # Get vocab_size from config
+        if 'vocab_size' in config:
+            dimensions['vocab_size'] = config['vocab_size']
+            
+        # Get num_latent from config (for latent models)
+        if 'num_latent' in config:
+            dimensions['num_latent'] = config['num_latent']
+            
+        # Get max_len from config if available
+        if 'max_len' in config:
+            dimensions['max_len'] = config['max_len']
+    
+    # Try to extract dimensions from state_dict structure if not found in config
+    # Check embedding weights for vocab size and d_model
+    for k, v in state_dict.items():
+        if k.endswith("embed.weight") or k == "embed.weight":
+            if dimensions['vocab_size'] is None:
+                dimensions['vocab_size'] = v.size(0)
+            if dimensions['d_model'] is None:
+                dimensions['d_model'] = v.size(1)
+            break
+    
+    # Check positional encoder for max_len and d_model
+    for k, v in state_dict.items():
+        if k.endswith("pos_encoder") or k == "pos_encoder":
+            dimensions['max_len'] = v.size(0)
+            if dimensions['d_model'] is None:
+                dimensions['d_model'] = v.size(1)
+            break
+    
+    # Extract layer numbers from keys if not found in config
+    if dimensions['num_layers'] is None:
+        layer_indices = []
+        for key in state_dict.keys():
+            if "encoder.layers." in key:
+                parts = key.split(".")
+                for i, part in enumerate(parts):
+                    if part == "layers" and i+1 < len(parts):
+                        try:
+                            layer_idx = int(parts[i+1])
+                            layer_indices.append(layer_idx)
+                        except ValueError:
+                            continue
+        
+        if layer_indices:
+            max_layer_idx = max(layer_indices)
+            dimensions['num_layers'] = max_layer_idx + 1  # +1 because indexing starts at 0
+    
+    return dimensions
+
+
 def main():
     # Register signal handler for Ctrl+C
     signal.signal(signal.SIGINT, signal_handler)
@@ -345,102 +427,37 @@ def main():
 
         try:
             # Load checkpoints to extract model dimensions
+            logger.info("Loading checkpoints to extract model dimensions")
             simple_checkpoint = torch.load(simple_checkpoint_path, map_location=device)
             latent_checkpoint = torch.load(latent_checkpoint_path, map_location=device)
 
-            # Extract model dimensions from checkpoints
-            checkpoint_d_model = None
+            # Extract model dimensions from checkpoints using our improved function
+            simple_dimensions = extract_model_dimensions(simple_checkpoint)
+            latent_dimensions = extract_model_dimensions(latent_checkpoint)
+
+            # Log the extracted dimensions for debugging
+            logger.info(f"Dimensions from SimpleTransformer checkpoint: {simple_dimensions}")
+            logger.info(f"Dimensions from LatentTransformer checkpoint: {latent_dimensions}")
+
+            # Update dimensions from checkpoints if they are valid
+            if simple_dimensions['d_model'] is not None:
+                logger.info(f"Setting d_model to {simple_dimensions['d_model']} from checkpoint")
+                args.d_model = simple_dimensions['d_model']
+            
+            if simple_dimensions['num_layers'] is not None:
+                logger.info(f"Setting num_layers to {simple_dimensions['num_layers']} from checkpoint")
+                args.num_layers = simple_dimensions['num_layers']
+
+            if latent_dimensions['num_latent'] is not None:
+                logger.info(f"Setting num_latent to {latent_dimensions['num_latent']} from checkpoint")
+                args.num_latent = latent_dimensions['num_latent']
+
+            # If vocab_size is found, use it for both models
             checkpoint_vocab_size = None
-            checkpoint_num_layers = None
-
-            # Check for d_model in config
-            if (
-                "config" in simple_checkpoint
-                and "d_model" in simple_checkpoint["config"]
-            ):
-                checkpoint_d_model = simple_checkpoint["config"]["d_model"]
-                logger.info(f"Found d_model={checkpoint_d_model} in checkpoint config")
-
-            # Try to extract vocab_size from embedding dimensions
-            if "embed.weight" in simple_checkpoint:
-                checkpoint_vocab_size = simple_checkpoint["embed.weight"].size(0)
-                logger.info(f"Found vocab_size={checkpoint_vocab_size} in checkpoint")
-            elif "model_state_dict" in simple_checkpoint:
-                for k, v in simple_checkpoint["model_state_dict"].items():
-                    if k.endswith("embed.weight") or k == "embed.weight":
-                        checkpoint_vocab_size = v.size(0)
-                        logger.info(f"Found vocab_size={checkpoint_vocab_size} in checkpoint state dict")
-                        break
+            if simple_dimensions['vocab_size'] is not None:
+                checkpoint_vocab_size = simple_dimensions['vocab_size']
+                logger.info(f"Using vocab_size={checkpoint_vocab_size} from checkpoint")
             
-            # Try to detect the number of layers by inspecting the keys in the state dict
-            if "model_state_dict" in simple_checkpoint:
-                state_dict = simple_checkpoint["model_state_dict"]
-            else:
-                state_dict = simple_checkpoint
-            
-            # Extract layer numbers from keys
-            layer_indices = []
-            for key in state_dict.keys():
-                if "encoder.layers." in key:
-                    parts = key.split(".")
-                    for i, part in enumerate(parts):
-                        if part == "layers" and i+1 < len(parts):
-                            try:
-                                layer_idx = int(parts[i+1])
-                                layer_indices.append(layer_idx)
-                            except ValueError:
-                                continue
-            
-            if layer_indices:
-                max_layer_idx = max(layer_indices)
-                checkpoint_num_layers = max_layer_idx + 1  # +1 because indexing starts at 0
-                logger.info(f"Detected {checkpoint_num_layers} layers from checkpoint state dict")
-
-            # Try to extract from model state dict if not in config
-            if checkpoint_d_model is None:
-                _, checkpoint_d_model = check_model_dimensions(
-                    simple_checkpoint, args.d_model
-                )
-                if checkpoint_d_model != args.d_model:
-                    logger.info(
-                        f"Found d_model={checkpoint_d_model} in checkpoint state dict"
-                    )
-
-            # If d_model is different from args, update args
-            if checkpoint_d_model is not None and checkpoint_d_model != args.d_model:
-                logger.info(
-                    f"Updating d_model from {args.d_model} to {checkpoint_d_model} to match checkpoint"
-                )
-                args.d_model = checkpoint_d_model
-
-            # Similarly for number of layers
-            if checkpoint_num_layers is not None and checkpoint_num_layers != args.num_layers:
-                logger.info(
-                    f"Updating num_layers from {args.num_layers} to {checkpoint_num_layers} to match checkpoint"
-                )
-                args.num_layers = checkpoint_num_layers
-
-            # Similarly for other params if they're in the checkpoint
-            if "config" in simple_checkpoint:
-                if (
-                    "num_layers" in simple_checkpoint["config"]
-                    and simple_checkpoint["config"]["num_layers"] != args.num_layers
-                    and checkpoint_num_layers is None  # Only update if we haven't already detected layers
-                ):
-                    logger.info(
-                        f"Updating num_layers from {args.num_layers} to {simple_checkpoint['config']['num_layers']} to match checkpoint"
-                    )
-                    args.num_layers = simple_checkpoint["config"]["num_layers"]
-
-                if (
-                    "num_latent" in simple_checkpoint["config"]
-                    and simple_checkpoint["config"]["num_latent"] != args.num_latent
-                ):
-                    logger.info(
-                        f"Updating num_latent from {args.num_latent} to {simple_checkpoint['config']['num_latent']} to match checkpoint"
-                    )
-                    args.num_latent = simple_checkpoint["config"]["num_latent"]
-
             # Store checkpoint data for later use
             simple_start_step = simple_checkpoint.get("step", 0)
             latent_start_step = latent_checkpoint.get("step", 0)
@@ -537,8 +554,8 @@ def main():
         nhead=8,
         num_layers=args.num_layers,
         dropout=0.25,
-    ).to(device)
-
+    )
+    
     # Create LatentTransformer (stable version)
     latent_transformer = StableLatentTransformer(
         vocab_size=vocab_size,
@@ -546,8 +563,49 @@ def main():
         nhead=8,
         num_layers=args.num_layers,
         num_latent=args.num_latent,
-        dropout=0.15,
-    ).to(device)
+        dropout=0.25,
+    )
+    
+    # Enable gradient checkpointing for memory efficiency
+    if args.use_checkpointing and torch.cuda.is_available():
+        logger.info("Enabling gradient checkpointing for memory efficiency")
+        if hasattr(simple_transformer.encoder, 'layers'):
+            simple_transformer.encoder.layers.apply(
+                lambda m: setattr(m, "_checkpoint", True)
+                if hasattr(m, "_checkpoint")
+                else None
+            )
+        if hasattr(simple_transformer.decoder, 'layers'):
+            simple_transformer.decoder.layers.apply(
+                lambda m: setattr(m, "_checkpoint", True)
+                if hasattr(m, "_checkpoint")
+                else None
+            )
+        if hasattr(latent_transformer.encoder, 'layers'):
+            latent_transformer.encoder.layers.apply(
+                lambda m: setattr(m, "_checkpoint", True)
+                if hasattr(m, "_checkpoint")
+                else None
+            )
+        if hasattr(latent_transformer.decoder, 'layers'):
+            latent_transformer.decoder.layers.apply(
+                lambda m: setattr(m, "_checkpoint", True)
+                if hasattr(m, "_checkpoint")
+                else None
+            )
+    
+    # Compile for performance (PyTorch 2.0 feature)
+    if torch.cuda.is_available() and not getattr(args, "disable_compile", False):
+        try:
+            simple_transformer = torch.compile(simple_transformer)
+            latent_transformer = torch.compile(latent_transformer)
+            logger.info("Models compiled with torch.compile()")
+        except Exception as e:
+            logger.warning(f"Model compilation failed: {str(e)}")
+    
+    # Move models to device
+    simple_transformer = simple_transformer.to(device)
+    latent_transformer = latent_transformer.to(device)
 
     # Count parameters
     simple_params = sum(p.numel() for p in simple_transformer.parameters())
@@ -634,22 +692,98 @@ def main():
         # Load SimpleTransformer checkpoint
         if os.path.exists(simple_checkpoint_path):
             logger.info(f"Loading SimpleTransformer checkpoint from {simple_checkpoint_path}")
-            simple_checkpoint = torch.load(simple_checkpoint_path)
+            simple_checkpoint = torch.load(simple_checkpoint_path, map_location=device)
             
-            # Load model weights
-            if 'model_state_dict' in simple_checkpoint:
+            # Apply the checkpoint
+            try:
                 simple_transformer.load_state_dict(simple_checkpoint['model_state_dict'], strict=False)
                 logger.info(f"Loaded SimpleTransformer model weights")
+            except RuntimeError as e:
+                logger.error(f"Error loading SimpleTransformer weights: {str(e)}")
+                # Error might be due to dimension mismatch which shouldn't happen anymore
+                # since we extract dimensions before creating models, but just in case:
+                logger.error("This might be due to dimension mismatch. Check model configuration.")
+                
+                # As a safety measure, extract dimensions again and recreate if needed
+                dimensions = extract_model_dimensions(simple_checkpoint)
+                if (dimensions['d_model'] is not None and dimensions['d_model'] != args.d_model) or \
+                   (dimensions['num_layers'] is not None and dimensions['num_layers'] != args.num_layers):
+                    logger.warning(f"Recreating model with dimensions from checkpoint: {dimensions}")
+                    
+                    # Need to modify Models.py to accept max_len parameter, or we need to hack it
+                    # after creation to match the checkpoint's max_len
+                    simple_transformer = StableSimpleTransformer(
+                        vocab_size=vocab_size,
+                        d_model=dimensions['d_model'] or args.d_model,
+                        nhead=8,
+                        num_layers=dimensions['num_layers'] or args.num_layers,
+                        dropout=0.25,
+                    )
+                    
+                    # If the max_len in the checkpoint is different from the default in the model,
+                    # we need to replace the pos_encoder Parameter with one of the correct size
+                    if 'pos_encoder' in simple_checkpoint['model_state_dict']:
+                        pos_encoder_tensor = simple_checkpoint['model_state_dict']['pos_encoder']
+                        if simple_transformer.pos_encoder.shape != pos_encoder_tensor.shape:
+                            logger.warning(f"Fixing pos_encoder shape mismatch: model has {simple_transformer.pos_encoder.shape} but checkpoint has {pos_encoder_tensor.shape}")
+                            # Replace the pos_encoder with one that matches the checkpoint
+                            simple_transformer.max_len = pos_encoder_tensor.shape[0]
+                            simple_transformer.pos_encoder = nn.Parameter(torch.zeros_like(pos_encoder_tensor))
+                        
+                        # Move model to device
+                        simple_transformer = simple_transformer.to(device)
+                        
+                        # Try loading again
+                        simple_transformer.load_state_dict(simple_checkpoint['model_state_dict'], strict=False)
+                        logger.info("Successfully loaded weights after model recreation")
+                    else:
+                        sys.exit(1)
         
         # Load LatentTransformer checkpoint
         if os.path.exists(latent_checkpoint_path):
             logger.info(f"Loading LatentTransformer checkpoint from {latent_checkpoint_path}")
-            latent_checkpoint = torch.load(latent_checkpoint_path)
+            latent_checkpoint = torch.load(latent_checkpoint_path, map_location=device)
             
-            # Load model weights
-            if 'model_state_dict' in latent_checkpoint:
+            # Apply the checkpoint
+            try:
                 latent_transformer.load_state_dict(latent_checkpoint['model_state_dict'], strict=False)
                 logger.info(f"Loaded LatentTransformer model weights")
+            except RuntimeError as e:
+                logger.error(f"Error loading LatentTransformer weights: {str(e)}")
+                
+                # As a safety measure, extract dimensions again and recreate if needed
+                dimensions = extract_model_dimensions(latent_checkpoint)
+                if (dimensions['d_model'] is not None and dimensions['d_model'] != args.d_model) or \
+                   (dimensions['num_layers'] is not None and dimensions['num_layers'] != args.num_layers) or \
+                   (dimensions['num_latent'] is not None and dimensions['num_latent'] != args.num_latent):
+                    logger.warning(f"Recreating model with dimensions from checkpoint: {dimensions}")
+                    latent_transformer = StableLatentTransformer(
+                        vocab_size=vocab_size,
+                        d_model=dimensions['d_model'] or args.d_model,
+                        nhead=8,
+                        num_layers=dimensions['num_layers'] or args.num_layers,
+                        num_latent=dimensions['num_latent'] or args.num_latent,
+                        dropout=0.25,
+                    )
+                    
+                    # If the max_len in the checkpoint is different from the default in the model,
+                    # we need to replace the pos_encoder Parameter with one of the correct size
+                    if 'pos_encoder' in latent_checkpoint['model_state_dict']:
+                        pos_encoder_tensor = latent_checkpoint['model_state_dict']['pos_encoder']
+                        if latent_transformer.pos_encoder.shape != pos_encoder_tensor.shape:
+                            logger.warning(f"Fixing pos_encoder shape mismatch: model has {latent_transformer.pos_encoder.shape} but checkpoint has {pos_encoder_tensor.shape}")
+                            # Replace the pos_encoder with one that matches the checkpoint
+                            latent_transformer.max_len = pos_encoder_tensor.shape[0]
+                            latent_transformer.pos_encoder = nn.Parameter(torch.zeros_like(pos_encoder_tensor))
+                        
+                        # Move model to device
+                        latent_transformer = latent_transformer.to(device)
+                        
+                        # Try loading again
+                        latent_transformer.load_state_dict(latent_checkpoint['model_state_dict'], strict=False)
+                        logger.info("Successfully loaded weights after model recreation")
+                    else:
+                        sys.exit(1)
 
     results = train_models_parallel(
         models={"simple": simple_transformer, "latent": latent_transformer},

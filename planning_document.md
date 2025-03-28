@@ -63,6 +63,29 @@
 - Must include teacher forcing parameters (schedule, current probability, start step)
 - Must include step counts separately for each model (simple and latent)
 - Must include recent loss history and stability windows
+- When resuming from checkpoints, model dimensions must be checked for consistency
+- Models should be recreated with the dimensions from checkpoints when mismatches are detected
+- Dimension mismatch most commonly occurs with d_model, num_layers, and num_latent parameters
+
+**Common Dimension Mismatch Issues:**
+- When checkpoint has d_model=64 but attempting to create model with d_model=320 (default)
+- When checkpoint has num_latent=4 but attempting to create model with num_latent=8 (default)
+- The fix requires extracting dimensions from checkpoint state_dict before creating models
+- If dimensions don't match after model creation, recreating the models with the correct dimensions
+
+## 7. Test Run Cleanup
+
+**Current Status:** To be implemented
+- Test runs accumulate in the `runs/` directory and runs JSON, cluttering the visualization and tracking
+- Need to develop a cleanup mechanism that:
+  - Detects test runs (based on naming patterns or metadata)
+  - Removes test runs from the filesystem (deleting TensorBoard logs)
+  - Removes test runs from the runs JSON index
+  - Implements a pruning strategy for old test runs
+- Best practices:
+  - Tests should use a specific prefix or tag to make them easily identifiable
+  - Clean up test runs after each test suite execution
+  - Implement an age-based cleanup for any remaining test runs
 
 ## Storage and Configuration Information
 

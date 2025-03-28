@@ -15,6 +15,7 @@ from loguru import logger
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.Models import StableSimpleTransformer, StableLatentTransformer
+from main import extract_model_dimensions  # Import the function from main.py
 
 # Initialize logging
 logger.remove()  # Remove default handler
@@ -44,12 +45,12 @@ def filter_state_dict_for_model(state_dict, model):
     
     return filtered_state_dict
 
-@pytest.mark.skipif(not os.path.exists('checkpoints/SimpleTransformer/latest.pt'), 
+@pytest.mark.skipif(not os.path.exists('checkpoints/simpletransformer/latest.pt'), 
                     reason="Requires a checkpoint file to test")
 def test_checkpoint_loading_with_layer_mismatch():
     """Test loading a checkpoint with layer mismatch using filtering"""
     # Get the latest checkpoint file
-    checkpoints_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'checkpoints/SimpleTransformer/')
+    checkpoints_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'checkpoints/simpletransformer/')
     if not os.path.exists(checkpoints_dir):
         pytest.skip("No checkpoints directory found")
     
@@ -123,6 +124,127 @@ def test_checkpoint_loading_with_layer_mismatch():
     except Exception as e:
         logger.error(f"Filtered loading failed: {str(e)}")
         assert False, f"Checkpoint loading failed: {str(e)}"
+
+@pytest.mark.skipif(not os.path.exists('checkpoints/simpletransformer/latest.pt'), 
+                    reason="Requires a checkpoint file to test")
+def test_checkpoint_dimensions_extraction():
+    """Test extraction of model dimensions from checkpoint and using them to create the model"""
+    # Get the latest checkpoint file
+    checkpoints_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'checkpoints/simpletransformer/')
+    checkpoint_file = os.path.join(checkpoints_dir, 'latest.pt')
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Load the checkpoint
+    logger.info(f"Loading checkpoint from {checkpoint_file}")
+    checkpoint = torch.load(checkpoint_file, map_location=device)
+    
+    # Debug checkpoint structure
+    if 'model_state_dict' in checkpoint:
+        logger.info("Checkpoint has 'model_state_dict' key")
+        some_keys = list(checkpoint['model_state_dict'].keys())[:5]
+        logger.info(f"Some keys in model_state_dict: {some_keys}")
+    else:
+        logger.info("Checkpoint does not have 'model_state_dict' key")
+        some_keys = list(checkpoint.keys())[:5]
+        logger.info(f"Some keys in checkpoint: {some_keys}")
+    
+    # Extract model dimensions from the checkpoint
+    extracted_dimensions = extract_model_dimensions(checkpoint)
+    logger.info(f"Extracted dimensions from checkpoint: {extracted_dimensions}")
+    
+    # Create a model with intentionally different dimensions
+    intentional_d_model = 128 if extracted_dimensions['d_model'] != 128 else 64
+    intentional_num_layers = 3 if extracted_dimensions['num_layers'] != 3 else 2
+    
+    logger.info(f"Creating model with intentionally different dimensions: d_model={intentional_d_model}, num_layers={intentional_num_layers}")
+    
+    # First, create with intentionally wrong dimensions
+    model = StableSimpleTransformer(
+        vocab_size=extracted_dimensions['vocab_size'],
+        d_model=intentional_d_model,
+        nhead=8,
+        num_layers=intentional_num_layers,
+        dropout=0.1,
+    )
+    
+    # Now check if dimensions mismatch is detected
+    try:
+        # Get state dict
+        state_dict = checkpoint.get("model_state_dict", checkpoint)
+        
+        # Try direct loading - should fail with size mismatch
+        try:
+            model.load_state_dict(state_dict, strict=True)
+            logger.warning("Loading with wrong dimensions unexpectedly succeeded. This may indicate a problem.")
+        except RuntimeError as e:
+            logger.info(f"Loading with wrong dimensions failed as expected: {str(e)}")
+        
+        # The main test: model recreation with correct dimensions
+        # This simulates what main.py should do when dimensions don't match
+        logger.info("Recreating model with correct dimensions from checkpoint")
+        recreated_model = StableSimpleTransformer(
+            vocab_size=extracted_dimensions['vocab_size'],
+            d_model=extracted_dimensions['d_model'],
+            nhead=8,
+            num_layers=extracted_dimensions['num_layers'],
+            dropout=0.1,
+        )
+        
+        # This should now work
+        recreated_model.load_state_dict(state_dict, strict=False)  # Using strict=False for safety
+        logger.info("Loading with correct dimensions succeeded")
+        
+        # Check the actual dimensions of the loaded model
+        assert recreated_model.d_model == extracted_dimensions['d_model'], \
+            f"Model d_model {recreated_model.d_model} doesn't match checkpoint {extracted_dimensions['d_model']}"
+        assert len(recreated_model.encoder.layers) == extracted_dimensions['num_layers'], \
+            f"Model layers {len(recreated_model.encoder.layers)} doesn't match checkpoint {extracted_dimensions['num_layers']}"
+        
+        assert True, "Model recreation with correct dimensions succeeded"
+    except Exception as e:
+        logger.error(f"Checkpoint loading test failed: {str(e)}")
+        raise  # Re-raise to see full traceback
+
+@pytest.mark.skipif(not os.path.exists('checkpoints/simpletransformer/latest.pt'), 
+                    reason="Requires a checkpoint file to test")
+def test_main_extract_model_dimensions():
+    """Test the extract_model_dimensions function from main.py"""
+    # Get the latest checkpoint file
+    checkpoints_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'checkpoints/simpletransformer/')
+    checkpoint_file = os.path.join(checkpoints_dir, 'latest.pt')
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Load the checkpoint
+    logger.info(f"Loading checkpoint from {checkpoint_file}")
+    checkpoint = torch.load(checkpoint_file, map_location=device)
+    
+    # Use the extract_model_dimensions function from main.py
+    dimensions = extract_model_dimensions(checkpoint)
+    
+    # Verify that the function extracted meaningful dimensions
+    logger.info(f"Extracted dimensions: {dimensions}")
+    
+    # Check that essential dimensions were extracted (not None)
+    assert dimensions['d_model'] is not None, "Failed to extract d_model"
+    assert dimensions['num_layers'] is not None, "Failed to extract num_layers"
+    assert dimensions['vocab_size'] is not None, "Failed to extract vocab_size"
+    
+    # Create a model with the extracted dimensions
+    model = StableSimpleTransformer(
+        vocab_size=dimensions['vocab_size'],
+        d_model=dimensions['d_model'],
+        nhead=8,
+        num_layers=dimensions['num_layers'],
+        dropout=0.1,
+    )
+    
+    # Check that the model can load the checkpoint
+    state_dict = checkpoint.get("model_state_dict", checkpoint)
+    model.load_state_dict(state_dict, strict=False)
+    
+    # Verify that model dimensions match what was extracted
+    assert model.d_model == dimensions['d_model'], f"Model d_model {model.d_model} doesn't match extracted {dimensions['d_model']}"
+    assert len(model.encoder.layers) == dimensions['num_layers'], f"Model layers {len(model.encoder.layers)} doesn't match extracted {dimensions['num_layers']}"
 
 def main():
     parser = argparse.ArgumentParser(description='Test checkpoint loading with layer mismatch')
