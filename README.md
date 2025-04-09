@@ -18,6 +18,22 @@ This repository contains the implementation of SimpleTransformer and LatentTrans
 tensorboard --logdir=runs/parallel_comparison
 ```
 
+## Latest Updates
+
+### Bug Fixes (2025-03-28)
+- Fixed checkpoint resume test issues:
+  - Corrected command order in test script
+  - Fixed incrementing max steps bug in tests
+- Improved stability in model implementations
+- Enhanced numerical stability with better parameter initialization
+- Added complete gradient checkpointing support for larger models
+
+### Model Improvements
+- Implemented stable versions of both SimpleTransformer and LatentTransformer
+- Added configurable bottleneck factor for LatentTransformer
+- Improved teacher forcing schedule options (linear, cosine, step)
+- Enhanced cross-attention implementation in LatentTransformer
+
 ## Technology Stack
 
 - **Framework**: PyTorch for deep learning models
@@ -208,7 +224,7 @@ To analyze and compare the efficiency of SimpleTransformer and LatentTransformer
 
 ```bash
 # Compare efficiency metrics between models using their checkpoints
-python calculate_efficiency.py
+python src/CalculateEfficiency.py
 ```
 
 This script:
@@ -240,7 +256,9 @@ latent/
 │   ├── SummaryWriter.py      # TensorBoard logging utilities
 │   ├── Training.py           # Training utilities
 │   ├── TrainingLoop.py       # Main training loop implementation
-│   └── Utils.py              # Utility functions
+│   ├── Utils.py              # Utility functions
+│   └── CalculateEfficiency.py # Model efficiency analysis
+├── tests/                    # Test suite for the project
 ├── scripts/                  # Utility scripts
 │   ├── checkpoint_utils/     # Checkpoint management utilities
 │   ├── list_runs.py          # List available runs
@@ -248,15 +266,28 @@ latent/
 │   ├── setup_env.sh          # Environment setup
 │   └── test_resume.sh        # Test resume functionality
 ├── checkpoints/              # Model checkpoint storage
-├── runs/                     # TensorBoard logs and run information
-└── requirements.txt          # Python dependencies
+├── runs/                     # TensorBoard logs directory
+└── requirements.txt          # Project dependencies
 ```
 
-## Key Modules
+## Environment Setup
 
-- **Models.py**: Implements the SimpleTransformer and LatentTransformer architectures
-- **TrainingLoop.py**: Handles the main training loop with evaluation and checkpointing
-- **Dataset.py**: Provides data generation and processing for multiplication tasks
-- **Metrics.py**: Implements evaluation metrics for model performance assessment
-- **RunManagement.py**: Manages experiment runs with unique IDs and configuration tracking
-- **Config.py**: Defines configuration parameters for models and training
+The project requires Python 3.8+ and the following main dependencies:
+- PyTorch 2.6.0
+- NumPy
+- pandas
+- tqdm
+- loguru
+- tensorboard
+- dask
+- joblib
+
+A complete list of dependencies is available in the requirements.txt file.
+
+## Model Comparison
+
+The project compares two models:
+1. **SimpleTransformer**: A standard transformer without latent tokens
+2. **LatentTransformer**: A transformer with latent tokens that serve as intermediate computation steps
+
+The goal is to evaluate whether the latent tokens allow the model to learn multiplication more efficiently by providing a mechanism to represent carry operations and intermediate states in the multiplication process.
