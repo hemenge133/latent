@@ -389,164 +389,159 @@ def train_models_parallel(
     if simple_checkpoint is not None:
         logger.info("Loading SimpleTransformer from checkpoint")
         try:
-            # Load model state dict
+            # --- Corrected Loading Order --- 
+            # 1. Load model state dict
             if 'model_state_dict' in simple_checkpoint:
-                # Filter state dict to match model architecture
                 filtered_state_dict = filter_state_dict_for_model(
                     simple_checkpoint['model_state_dict'], models_dict["simple"]["model"]
                 )
                 models_dict["simple"]["model"].load_state_dict(filtered_state_dict, strict=False)
                 logger.info(f"Loaded filtered SimpleTransformer state dict with {len(filtered_state_dict)} parameters")
             else:
-                # Filter state dict to match model architecture 
                 filtered_state_dict = filter_state_dict_for_model(
                     simple_checkpoint, models_dict["simple"]["model"]
                 )
                 models_dict["simple"]["model"].load_state_dict(filtered_state_dict, strict=False)
                 logger.info(f"Loaded filtered SimpleTransformer state dict")
-            
-            # Load optimizer state - do this BEFORE setting learning rate
-            if 'optimizer_state_dict' in simple_checkpoint:
-                # Store current learning rate for safety
-                current_lr = simple_optimizer.param_groups[0]['lr']
-                
-                # Load optimizer state
-                simple_optimizer.load_state_dict(simple_checkpoint['optimizer_state_dict'])
-                logger.info("Loaded SimpleTransformer optimizer state")
-                
-                # Get step count 
-                step_count = simple_checkpoint.get('step', 0)
-                
-                # Now set the learning rate consistently
-                if 'last_lr' in simple_checkpoint:
-                    # Get saved learning rate from checkpoint
-                    saved_lr = simple_checkpoint['last_lr']
-                    logger.info(f"Using saved learning rate from checkpoint: {saved_lr}")
-                    
-                    # Apply saved LR to all parameter groups
-                    for param_group in simple_optimizer.param_groups:
-                        param_group['lr'] = saved_lr
-                    
-                    # Store for consistency check
-                    prev_lrs['simple'] = saved_lr
-                else:
-                    # If no saved LR found, keep the current one
-                    logger.info(f"No learning rate found in checkpoint, keeping current: {current_lr}")
-                    
-                    # Store for consistency check
-                    prev_lrs['simple'] = current_lr
-            
-            # Load scheduler - do this AFTER setting optimizer learning rate
+
+            # Get step count for potential scheduler fast-forwarding
+            step_count = simple_checkpoint.get('step', 0)
+
+            # 2. Load scheduler state first
+            scheduler_loaded_ok = False
             if 'scheduler_state_dict' in simple_checkpoint:
                 try:
                     simple_scheduler.load_state_dict(simple_checkpoint['scheduler_state_dict'])
                     logger.info("Loaded SimpleTransformer scheduler state")
+                    scheduler_loaded_ok = True
                 except Exception as e:
-                    logger.warning(f"Error loading scheduler state dict: {e}")
-                    logger.warning("Creating new scheduler with current optimizer state")
-                    
-                    # Recreate scheduler based on current optimizer state
+                    logger.warning(f"Error loading Simple scheduler state dict: {e}. Recreating scheduler.")
                     simple_scheduler = get_cosine_schedule_with_warmup(
-                        simple_optimizer,
-                        num_warmup_steps=config.warmup_steps,
+                        simple_optimizer, 
+                        num_warmup_steps=config.warmup_steps, 
                         num_training_steps=max_steps
                     )
-                    
-                    # Fast-forward scheduler to current step if resuming
+                    # Fast-forward the new scheduler
                     if step_count > 0:
                         for _ in range(step_count):
-                            simple_scheduler.step()
-                        logger.info(f"Fast-forwarded new SimpleTransformer scheduler to step {step_count}")
-                    
+                             simple_scheduler.step()
+                        logger.info(f"Fast-forwarded new Simple scheduler to step {step_count}")
                     models_dict["simple"]["scheduler"] = simple_scheduler
-            
+                    
+            # 3. Load optimizer state 
+            if 'optimizer_state_dict' in simple_checkpoint:
+                try:
+                    simple_optimizer.load_state_dict(simple_checkpoint['optimizer_state_dict'])
+                    logger.info("Loaded SimpleTransformer optimizer state")
+
+                    # 4. Set LR AFTER loading both scheduler and optimizer
+                    # Use the scheduler's current LR after loading its state
+                    current_scheduler_lr = simple_scheduler.get_last_lr()[0] 
+                    logger.info(f"Setting optimizer LR groups to scheduler's current LR: {current_scheduler_lr}")
+                    for param_group in simple_optimizer.param_groups:
+                        param_group['lr'] = current_scheduler_lr
+                    prev_lrs['simple'] = current_scheduler_lr # Update tracker
+
+                except ValueError as ve:
+                     logger.error(f"ValueError loading Simple optimizer state: {ve}. This might happen if model architecture changed.")
+                     logger.error(traceback.format_exc())
+                     # Potentially skip optimizer loading if dimensions mismatch
+                except Exception as e:
+                     logger.error(f"Error loading Simple optimizer state dict: {e}")
+                     logger.error(traceback.format_exc())
+            else:
+                 logger.warning("Optimizer state dict not found in Simple checkpoint.")
+                 # Set initial LR based on scheduler if optimizer state wasn't loaded
+                 initial_scheduler_lr = simple_scheduler.get_last_lr()[0]
+                 logger.info(f"Setting optimizer LR groups to initial scheduler LR: {initial_scheduler_lr}")
+                 for param_group in simple_optimizer.param_groups:
+                     param_group['lr'] = initial_scheduler_lr
+                 prev_lrs['simple'] = initial_scheduler_lr
+            # --- End Corrected Loading Order --- 
+
             # Ensure TensorBoard continuity with checkpoint
             ensure_checkpoint_tensorboard_consistency(models_dict["simple"], simple_checkpoint)
-            
+
         except Exception as e:
-            logger.error(f"Error loading SimpleTransformer checkpoint: {e}")
+            logger.error(f"Error processing SimpleTransformer checkpoint: {e}")
             logger.error(traceback.format_exc())
-            
 
     if latent_checkpoint is not None:
         logger.info("Loading LatentTransformer from checkpoint")
         try:
-            # Load model state dict
+            # --- Corrected Loading Order --- 
+            # 1. Load model state dict
             if 'model_state_dict' in latent_checkpoint:
-                # Filter state dict to match model architecture
                 filtered_state_dict = filter_state_dict_for_model(
                     latent_checkpoint['model_state_dict'], models_dict["latent"]["model"]
                 )
                 models_dict["latent"]["model"].load_state_dict(filtered_state_dict, strict=False)
                 logger.info(f"Loaded filtered LatentTransformer state dict with {len(filtered_state_dict)} parameters")
             else:
-                # Filter state dict to match model architecture
                 filtered_state_dict = filter_state_dict_for_model(
                     latent_checkpoint, models_dict["latent"]["model"]
                 )
                 models_dict["latent"]["model"].load_state_dict(filtered_state_dict, strict=False)
                 logger.info(f"Loaded filtered LatentTransformer state dict")
-                
-            # Load optimizer state - do this BEFORE setting learning rate  
-            if 'optimizer_state_dict' in latent_checkpoint:
-                # Store current learning rate for safety
-                current_lr = latent_optimizer.param_groups[0]['lr']
-                
-                # Load optimizer state
-                latent_optimizer.load_state_dict(latent_checkpoint['optimizer_state_dict'])
-                logger.info("Loaded LatentTransformer optimizer state")
-                
-                # Get step count
-                step_count = latent_checkpoint.get('step', 0)
-                
-                # Now set the learning rate consistently
-                if 'last_lr' in latent_checkpoint:
-                    # Get saved learning rate from checkpoint
-                    saved_lr = latent_checkpoint['last_lr']
-                    logger.info(f"Using saved learning rate from checkpoint: {saved_lr}")
-                    
-                    # Apply saved LR to all parameter groups
-                    for param_group in latent_optimizer.param_groups:
-                        param_group['lr'] = saved_lr
-                    
-                    # Store for consistency check
-                    prev_lrs['latent'] = saved_lr
-                else:
-                    # If no saved LR found, keep the current one
-                    logger.info(f"No learning rate found in checkpoint, keeping current: {current_lr}")
-                    
-                    # Store for consistency check
-                    prev_lrs['latent'] = current_lr
-            
-            # Load scheduler - do this AFTER setting optimizer learning rate
+
+            # Get step count for potential scheduler fast-forwarding
+            step_count = latent_checkpoint.get('step', 0)
+
+            # 2. Load scheduler state first
+            scheduler_loaded_ok = False
             if 'scheduler_state_dict' in latent_checkpoint:
                 try:
                     latent_scheduler.load_state_dict(latent_checkpoint['scheduler_state_dict'])
                     logger.info("Loaded LatentTransformer scheduler state")
+                    scheduler_loaded_ok = True
                 except Exception as e:
-                    logger.warning(f"Error loading scheduler state dict: {e}")
-                    logger.warning("Creating new scheduler with current optimizer state")
-                    
-                    # Recreate scheduler based on current optimizer state
+                    logger.warning(f"Error loading Latent scheduler state dict: {e}. Recreating scheduler.")
                     latent_scheduler = get_cosine_schedule_with_warmup(
-                        latent_optimizer,
-                        num_warmup_steps=config.warmup_steps,
+                        latent_optimizer, 
+                        num_warmup_steps=config.warmup_steps, 
                         num_training_steps=max_steps
                     )
-                    
-                    # Fast-forward scheduler to current step if resuming
+                    # Fast-forward the new scheduler
                     if step_count > 0:
                         for _ in range(step_count):
-                            latent_scheduler.step()
-                        logger.info(f"Fast-forwarded new LatentTransformer scheduler to step {step_count}")
-                    
+                             latent_scheduler.step()
+                        logger.info(f"Fast-forwarded new Latent scheduler to step {step_count}")
                     models_dict["latent"]["scheduler"] = latent_scheduler
-            
+
+            # 3. Load optimizer state
+            if 'optimizer_state_dict' in latent_checkpoint:
+                try:
+                    latent_optimizer.load_state_dict(latent_checkpoint['optimizer_state_dict'])
+                    logger.info("Loaded LatentTransformer optimizer state")
+
+                    # 4. Set LR AFTER loading both scheduler and optimizer
+                    current_scheduler_lr = latent_scheduler.get_last_lr()[0]
+                    logger.info(f"Setting optimizer LR groups to scheduler's current LR: {current_scheduler_lr}")
+                    for param_group in latent_optimizer.param_groups:
+                        param_group['lr'] = current_scheduler_lr
+                    prev_lrs['latent'] = current_scheduler_lr # Update tracker
+
+                except ValueError as ve:
+                    logger.error(f"ValueError loading Latent optimizer state: {ve}. This might happen if model architecture changed.")
+                    logger.error(traceback.format_exc())
+                except Exception as e:
+                    logger.error(f"Error loading Latent optimizer state dict: {e}")
+                    logger.error(traceback.format_exc())
+            else:
+                logger.warning("Optimizer state dict not found in Latent checkpoint.")
+                # Set initial LR based on scheduler if optimizer state wasn't loaded
+                initial_scheduler_lr = latent_scheduler.get_last_lr()[0]
+                logger.info(f"Setting optimizer LR groups to initial scheduler LR: {initial_scheduler_lr}")
+                for param_group in latent_optimizer.param_groups:
+                    param_group['lr'] = initial_scheduler_lr
+                prev_lrs['latent'] = initial_scheduler_lr
+            # --- End Corrected Loading Order --- 
+
             # Ensure TensorBoard continuity with checkpoint
             ensure_checkpoint_tensorboard_consistency(models_dict["latent"], latent_checkpoint)
-            
+
         except Exception as e:
-            logger.error(f"Error loading LatentTransformer checkpoint: {e}")
+            logger.error(f"Error processing LatentTransformer checkpoint: {e}")
             logger.error(traceback.format_exc())
     
     # After loading checkpoints, reset the seed to ensure reproducibility
@@ -951,6 +946,23 @@ def train_models_parallel(
                             model_checkpoint_dir = f"checkpoints/{model_info['name'].lower()}"
                             os.makedirs(model_checkpoint_dir, exist_ok=True)
                             current_lr = optimizer.param_groups[0]['lr']
+                            # --- Construct Config Dict from args/model --- 
+                            best_config_dict = {
+                                # Pull from args if available, otherwise maybe model properties
+                                'd_model': args.d_model if args and hasattr(args, 'd_model') else getattr(model, 'd_model', None), 
+                                'num_layers': args.num_layers if args and hasattr(args, 'num_layers') else getattr(model, 'num_layers', None),
+                                'num_latent': args.num_latent if args and hasattr(args, 'num_latent') else getattr(model, 'num_latent', None),
+                                'seed': args.seed if args and hasattr(args, 'seed') else 42,
+                                'batch_size': args.batch_size if args and hasattr(args, 'batch_size') else None,
+                                'min_digits': args.min_digits if args and hasattr(args, 'min_digits') else None,
+                                'max_digits': args.max_digits if args and hasattr(args, 'max_digits') else None,
+                                'accuracy_weight': args.accuracy_weight if args and hasattr(args, 'accuracy_weight') else None,
+                                # Use run variables for TF schedule state
+                                'tf_schedule': tf_schedule, 
+                                'tf_start_step': tf_start_step, 
+                                'max_steps': max_steps # Actual max steps for the run
+                            }
+                            # --- End Construct Config Dict --- 
                             torch.save({
                                 'step': model_info["step"],
                                 'model_state_dict': model.state_dict(),
@@ -958,9 +970,7 @@ def train_models_parallel(
                                 'scheduler_state_dict': model_info["scheduler"].state_dict(),
                                 'val_loss': val_loss,
                                 'val_sequence_accuracy': val_sequence_accuracy,
-                                'config': model_info["config"].__dict__,
-                                'seed': getattr(model_info["config"], "seed", 42),
-                                'd_model': getattr(model_info["config"], "d_model", 64),
+                                'config': best_config_dict, # Use constructed dict
                                 'last_lr': current_lr,
                             }, f"{model_checkpoint_dir}/{model_info['name'].lower()}_best.pt")
                             logger.info(f"Saved new best model for {model_info['name']} (val_loss: {val_loss:.6f})")
@@ -973,30 +983,53 @@ def train_models_parallel(
                             model_checkpoint_dir = f"checkpoints/{model_info['name'].lower()}"
                             os.makedirs(model_checkpoint_dir, exist_ok=True)
                             current_lr = optimizer.param_groups[0]['lr']
-                            torch.save({
-                                'model_state_dict': model.state_dict(),
-                                'optimizer_state_dict': optimizer.state_dict(),
-                                'scheduler_state_dict': model_info["scheduler"].state_dict(),
-                                'step': model_info["step"],
-                                'val_loss': model_info.get("val_loss", float('inf')),
-                                'val_sequence_accuracy': model_info.get("val_sequence_accuracy", 0.0),
-                                'config': model_info["config"].__dict__,
-                                'seed': getattr(model_info["config"], "seed", 42),
-                                'd_model': getattr(model_info["config"], "d_model", 64),
-                                'last_lr': current_lr,
-                                # Save teacher forcing state
-                                'tf_schedule': tf_schedule,
-                                'tf_start_step': tf_start_step,
-                                'tf_current_probability': tf_prob,
-                                # Save additional training state
-                                'stability_window': model_info.get("stability_window", 100),
-                                'recent_losses_mean': sum(model_info["recent_losses"])/len(model_info["recent_losses"]) if model_info["recent_losses"] else 0.0,
-                                'max_steps': max_steps
-                            }, f"{model_checkpoint_dir}/{model_info['name'].lower()}_latest.pt")
+                            save_path = f"{model_checkpoint_dir}/{model_info['name'].lower()}_latest.pt"
+                            
+                            # --- Construct Config Dict from args/model --- 
+                            latest_config_dict = {
+                                'd_model': args.d_model if args and hasattr(args, 'd_model') else getattr(model, 'd_model', None), 
+                                'num_layers': args.num_layers if args and hasattr(args, 'num_layers') else getattr(model, 'num_layers', None),
+                                'num_latent': args.num_latent if args and hasattr(args, 'num_latent') else getattr(model, 'num_latent', None),
+                                'seed': args.seed if args and hasattr(args, 'seed') else 42,
+                                'batch_size': args.batch_size if args and hasattr(args, 'batch_size') else None,
+                                'min_digits': args.min_digits if args and hasattr(args, 'min_digits') else None,
+                                'max_digits': args.max_digits if args and hasattr(args, 'max_digits') else None,
+                                'accuracy_weight': args.accuracy_weight if args and hasattr(args, 'accuracy_weight') else None,
+                                # Use run variables for TF schedule state
+                                'tf_schedule': tf_schedule, 
+                                'tf_start_step': tf_start_step, 
+                                'tf_current_probability': tf_prob, # Save current TF prob
+                                'max_steps': max_steps # Actual max steps for the run
+                            }
+                            # --- End Construct Config Dict --- 
+
+                            # --- Add detailed save logging/error handling ---
+                            logger.info(f"Attempting to save latest checkpoint for {model_info['name']} at step {model_info['step']} to {save_path}")
+                            try:
+                                torch.save({
+                                    'model_state_dict': model.state_dict(),
+                                    'optimizer_state_dict': optimizer.state_dict(),
+                                    'scheduler_state_dict': model_info["scheduler"].state_dict(),
+                                    'step': model_info["step"],
+                                    'val_loss': model_info.get("val_loss", float('inf')),
+                                    'val_sequence_accuracy': model_info.get("val_sequence_accuracy", 0.0),
+                                    'config': latest_config_dict, # Use constructed dict
+                                    'last_lr': current_lr,
+                                    # Save additional training state (not part of config)
+                                    'stability_window': model_info.get("stability_window", 100),
+                                    'recent_losses_mean': sum(model_info["recent_losses"])/len(model_info["recent_losses"]) if model_info["recent_losses"] else 0.0,
+                                }, save_path) 
+                                logger.info(f"Successfully saved latest checkpoint for {model_info['name']} to {save_path}")
+                            except Exception as save_err:
+                                logger.error(f"!!! FAILED to save latest checkpoint for {model_info['name']} to {save_path} !!!")
+                                logger.error(f"Save error: {save_err}")
+                                logger.error(traceback.format_exc())
+                            # --- End detailed save logging --- 
                             
                             if not perform_validation:
-                                # Only log this if we haven't already logged validation results
-                                logger.info(f"Saved checkpoint for {model_info['name']} at step {model_info['step']}")
+                                # Only log this if we haven't already logged validation results (redundant log now?)
+                                # logger.info(f"Saved checkpoint for {model_info['name']} at step {model_info['step']}")
+                                pass # Logging handled above
                 except Exception as e:
                     logger.error(f"Error in training step for {model_info['name']}: {e}")
                     logger.error(f"Traceback: {traceback.format_exc()}")

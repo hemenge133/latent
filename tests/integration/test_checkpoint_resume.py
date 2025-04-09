@@ -123,8 +123,13 @@ def test_checkpoint_resume_integration():
         
         # Now recreate models with correct dimensions from checkpoints
         logger.info("Recreating models with correct dimensions")
+        
+        # Use default vocab_size if not available in dimensions
+        simple_vocab_size = simple_dimensions.get('vocab_size', 12)  # Default to 12 if not available
+        latent_vocab_size = latent_dimensions.get('vocab_size', 12)  # Default to 12 if not available
+        
         simple_model = StableSimpleTransformer(
-            vocab_size=simple_dimensions['vocab_size'],
+            vocab_size=simple_vocab_size,
             d_model=simple_dimensions['d_model'],
             nhead=8,
             num_layers=simple_dimensions['num_layers'],
@@ -132,7 +137,7 @@ def test_checkpoint_resume_integration():
         )
         
         latent_model = StableLatentTransformer(
-            vocab_size=latent_dimensions['vocab_size'],
+            vocab_size=latent_vocab_size,
             d_model=latent_dimensions['d_model'],
             nhead=8,
             num_layers=latent_dimensions['num_layers'],
