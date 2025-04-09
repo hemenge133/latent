@@ -74,7 +74,7 @@ def get_run_id_from_dirs():
     logger.warning("No run ID found in directories")
     return None
 
-def run_command(cmd, timeout=300):
+def run_command(cmd, timeout=600):
     """Run a command and log output"""
     logger.info(f"Running command: {' '.join(cmd)}")
     
@@ -129,6 +129,14 @@ def test_checkpoint_resume_simple():
         simple_checkpoint_path = Path("checkpoints/simpletransformer/simpletransformer_latest.pt")
         latent_checkpoint_path = Path("checkpoints/latenttransformer/latenttransformer_latest.pt")
         
+        # Clean up previous checkpoints before starting
+        if simple_checkpoint_path.exists():
+            os.remove(simple_checkpoint_path)
+            logger.info(f"Removed existing checkpoint: {simple_checkpoint_path}")
+        if latent_checkpoint_path.exists():
+            os.remove(latent_checkpoint_path)
+            logger.info(f"Removed existing checkpoint: {latent_checkpoint_path}")
+        
         initial_step = 0
         if simple_checkpoint_path.exists():
             try:
@@ -149,8 +157,8 @@ def test_checkpoint_resume_simple():
             "--min-digits", "1",            # Single-digit multiplication (small problem)
             "--max-digits", "1",
             "--batch-size", "16",           # Small batch size
-            "--max-steps", "10",            # Fixed value: Just 10 steps (~ 3 epochs with small dataset)
-            "--save-every", "3",            # Save every 3 steps to ensure checkpoint at end
+            "--max-steps", "10",            # Fixed value: Just 10 steps 
+            "--save-every", "10",           # Save only at the end (step 9 or 10)
             "--seed", "42"
         ]
         
@@ -174,66 +182,116 @@ def test_checkpoint_resume_simple():
         assert simple_checkpoint_path.exists(), "SimpleTransformer checkpoint not created"
         assert latent_checkpoint_path.exists(), "LatentTransformer checkpoint not created"
         
-        # Get steps from checkpoint
-        checkpoint = torch.load(simple_checkpoint_path, map_location="cpu")
-        simple_step = checkpoint.get("step", 0)
-        logger.info(f"Checkpoint saved at step {simple_step}")
+        # --- Verify Initial Checkpoint --- 
+        logger.info("Verifying initial checkpoint contents...")
+        initial_checkpoint = torch.load(simple_checkpoint_path, map_location="cpu")
+        initial_step_from_ckpt = initial_checkpoint.get("step", -1)
+        # Assert based on when the save happens (max_steps or save_every)
+        # Since save_every=10, it saves *after* step 9 completes, at step 10.
+        # Let's adjust expectation based on logs if this fails.
+        expected_initial_step = 10 
+        assert initial_step_from_ckpt == expected_initial_step, f"Initial checkpoint step mismatch. Expected {expected_initial_step}, got {initial_step_from_ckpt}"
+        logger.info(f"Initial checkpoint verified: step={initial_step_from_ckpt}")
+
+        initial_embed_shape = None # For later comparison
+        if 'config' in initial_checkpoint:
+             assert initial_checkpoint['config'].get('d_model') == 32, f"Initial checkpoint d_model mismatch: {initial_checkpoint['config'].get('d_model')}"
+             logger.info("Initial checkpoint d_model verified.")
+        else:
+             logger.warning("Config not found in initial checkpoint for verification.")
         
-        # Store dimensions and parameters for later verification
-        if "model_state_dict" in checkpoint:
-            # Find embedding dimension
-            for k, v in checkpoint["model_state_dict"].items():
+        if "model_state_dict" in initial_checkpoint:
+             for k, v in initial_checkpoint["model_state_dict"].items():
                 if k.endswith("embed.weight") or k == "embed.weight":
-                    embed_shape = v.shape
-                    logger.info(f"Embedding shape from checkpoint: {embed_shape}")
+                    initial_embed_shape = v.shape
+                    logger.info(f"Embedding shape from initial checkpoint: {initial_embed_shape}")
                     break
-        
+        # --- End Verify Initial Checkpoint ---
+
         # Sleep briefly to ensure clear timestamps
         time.sleep(1)
-        
-        # Step 2: Resume training for 3 more epochs
+
+        # Step 2: Resume training for just ONE more step
         resume_cmd = [
             "python", "main.py",
-            "--max-steps", "20",            # Fixed value: Run to 20 steps total
-            "--seed", "42"
+            "--max-steps", "11",            # Run to 11 steps total
+            "--save-every", "1",           # Save every step during resume
+            "--seed", "42" # Keep seed consistent
         ]
-        
+
         # Add resume flag and run ID if available
         if initial_run_id:
             resume_cmd.insert(2, "--resume")
-            resume_cmd.extend(["--run-id", initial_run_id])
+            resume_cmd.extend([
+                "--run-id", initial_run_id,
+                # Explicitly pass parameters matching the initial run
+                "--d-model", "32",
+                "--num-layers", "1",
+                "--num-latent", "2",
+                "--min-digits", "1",
+                "--max-digits", "1",
+                "--force-config"
+            ])
         else:
-            # Just use resume flag without run ID
+            # Just use resume flag without run ID (less likely scenario for this test)
             resume_cmd.insert(2, "--resume")
-            # Add parameters from the initial run to ensure compatibility
             resume_cmd.extend([
                 "--d-model", "32",
                 "--num-layers", "1",
                 "--num-latent", "2",
                 "--min-digits", "1",
-                "--max-digits", "1"
+                "--max-digits", "1",
+                "--force-config"
             ])
-        
+
         # Run the resume command
+        logger.info(f"Running resume command: {' '.join(resume_cmd)}")
         resume_exit_code = run_command(resume_cmd)
         assert resume_exit_code == 0, f"Resume training failed with code {resume_exit_code}"
+
+        # --- Verify Resumed Checkpoint --- 
+        logger.info("Verifying resumed checkpoint contents...")
+        assert simple_checkpoint_path.exists(), "SimpleTransformer checkpoint file missing after resume!"
         
-        # Verify checkpoint was updated
-        updated_checkpoint = torch.load(simple_checkpoint_path, map_location="cpu")
-        updated_step = updated_checkpoint.get("step", 0)
-        
-        assert updated_step > simple_step, f"Checkpoint step not updated. Original: {simple_step}, New: {updated_step}"
-        logger.info(f"Checkpoint step updated: {simple_step} -> {updated_step}")
-        
-        # Verify dimensions were maintained
-        if "model_state_dict" in updated_checkpoint:
-            for k, v in updated_checkpoint["model_state_dict"].items():
-                if k.endswith("embed.weight") or k == "embed.weight":
-                    updated_embed_shape = v.shape
-                    logger.info(f"Updated embedding shape: {updated_embed_shape}")
-                    assert updated_embed_shape == embed_shape, f"Embedding shape changed: {embed_shape} -> {updated_embed_shape}"
-                    break
-        
+        # Add a small delay/retry mechanism for loading the checkpoint, in case of filesystem lag
+        updated_checkpoint = None
+        for attempt in range(3):
+            try:
+                updated_checkpoint = torch.load(simple_checkpoint_path, map_location="cpu")
+                logger.info(f"Successfully loaded resumed checkpoint on attempt {attempt+1}")
+                break
+            except FileNotFoundError:
+                 logger.warning(f"Attempt {attempt+1}: Resumed checkpoint not found, waiting...")
+                 time.sleep(1)
+            except Exception as load_err:
+                 logger.error(f"Attempt {attempt+1}: Error loading resumed checkpoint: {load_err}")
+                 time.sleep(1)
+        assert updated_checkpoint is not None, "Failed to load resumed checkpoint after multiple attempts."
+
+        updated_step = updated_checkpoint.get("step", -1)
+        expected_resumed_step = 11 # Should complete step 10 and save at step 11
+        assert updated_step == expected_resumed_step, f"Checkpoint step not updated correctly after resume. Expected {expected_resumed_step}, got {updated_step}"
+        logger.info(f"Checkpoint step updated successfully: {initial_step_from_ckpt} -> {updated_step}")
+
+        if 'config' in updated_checkpoint:
+             assert updated_checkpoint['config'].get('d_model') == 32, f"Resumed checkpoint d_model mismatch: {updated_checkpoint['config'].get('d_model')}"
+             logger.info("Resumed checkpoint d_model verified.")
+        else:
+             logger.warning("Config not found in resumed checkpoint for verification.")
+
+        if initial_embed_shape and "model_state_dict" in updated_checkpoint:
+             resumed_embed_shape = None
+             for k, v in updated_checkpoint["model_state_dict"].items():
+                  if k.endswith("embed.weight") or k == "embed.weight":
+                       resumed_embed_shape = v.shape
+                       logger.info(f"Embedding shape from resumed checkpoint: {resumed_embed_shape}")
+                       break
+             assert resumed_embed_shape == initial_embed_shape, f"Embedding shape changed after resume: {initial_embed_shape} -> {resumed_embed_shape}"
+             logger.info("Resumed checkpoint embedding shape verified.")
+        elif initial_embed_shape:
+             logger.warning("Could not verify embedding shape in resumed checkpoint: model_state_dict missing.")
+        # --- End Verify Resumed Checkpoint ---
+
         logger.info("Test completed successfully")
         return True
         

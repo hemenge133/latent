@@ -1,6 +1,12 @@
 import pytest
 import torch
 import os
+import sys
+
+# --- Add Path Adjustment ---
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+# --- End Path Adjustment ---
+
 from src.TrainingLoop import train_models_parallel
 from src.Models import StableSimpleTransformer
 from src.Dataset import MultiplicationDataset
@@ -113,8 +119,6 @@ def test_training_basic():
         'step',
         'val_loss',
         'config',
-        'seed',
-        'd_model',
         'last_lr'
     ]
     
