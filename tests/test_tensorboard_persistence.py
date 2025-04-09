@@ -173,15 +173,17 @@ def test_tensorboard_metrics_persistence():
             dataset=dataset,
             dataset_val=val_dataset,
             vocab_size=vocab_size,
-            criterion=criterion,
             device=device,
             max_steps=3,  # Run for just 3 steps
             batch_size=4,
-            learning_rate=3e-4,
             config=config,
             models_params=models_params,
             start_step=0,
             log_dir=log_dir,
+            simple_lr=3e-4,
+            simple_wd=0.01,
+            latent_lr=1e-4,
+            latent_wd=0.01,
             checkpoint_paths={
                 "simple": simple_checkpoint_path,
                 "latent": latent_checkpoint_path
@@ -242,17 +244,19 @@ def test_tensorboard_metrics_persistence():
             dataset=dataset,
             dataset_val=val_dataset,
             vocab_size=vocab_size,
-            criterion=criterion,
             device=device,
             max_steps=simple_last_step + 3,  # Run for 3 more steps from where we left off
             batch_size=4,
-            learning_rate=3e-4,
             config=config,
             models_params=models_params,
             start_step=simple_last_step,  # Resume from last step
             simple_checkpoint=simple_checkpoint,
             latent_checkpoint=latent_checkpoint,
             log_dir=log_dir,
+            simple_lr=3e-4,
+            simple_wd=0.01,
+            latent_lr=1e-4,
+            latent_wd=0.01,
             checkpoint_paths={
                 "simple": simple_checkpoint_path,
                 "latent": latent_checkpoint_path

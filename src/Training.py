@@ -185,7 +185,16 @@ def generate_evaluation_examples(dataset, device, min_digits):
     return eval_examples
 
 
-def setup_models_training(simple_model, latent_model, device, max_steps):
+def setup_models_training(
+    simple_model,
+    latent_model,
+    device,
+    max_steps,
+    simple_lr=3e-4,
+    simple_wd=0.03,
+    latent_lr=1e-4,
+    latent_wd=0.01,
+):
     """Setup optimizers and schedulers for training"""
     # Higher learning rate for SimpleTransformer since it needs to be more efficient
     # Use warmup to stabilize training
@@ -199,15 +208,15 @@ def setup_models_training(simple_model, latent_model, device, max_steps):
     # For SimpleTransformer
     simple_optimizer = optim.AdamW(
         simple_model.parameters(),
-        lr=1e-3,  # Starting LR for OneCycleLR
+        lr=1e-3,  # Starting LR for OneCycleLR (will be overridden by scheduler)
         betas=(0.9, 0.98),
         eps=1e-9,
-        weight_decay=0.03,
+        weight_decay=simple_wd,  # Use parameter
     )
 
     simple_scheduler = optim.lr_scheduler.OneCycleLR(
         simple_optimizer,
-        max_lr=3e-4,
+        max_lr=simple_lr,  # Use parameter
         total_steps=scheduler_max_steps,  # Use buffered steps
         pct_start=0.05,  # Quick warmup
         div_factor=10.0,  # min_lr = max_lr / div_factor
@@ -217,15 +226,15 @@ def setup_models_training(simple_model, latent_model, device, max_steps):
     # For LatentTransformer
     latent_optimizer = optim.AdamW(
         latent_model.parameters(),
-        lr=3e-4,  # Starting LR for OneCycleLR
+        lr=3e-4,  # Starting LR for OneCycleLR (will be overridden by scheduler)
         betas=(0.9, 0.95),
         eps=1e-9,
-        weight_decay=0.01,
+        weight_decay=latent_wd,  # Use parameter
     )
 
     latent_scheduler = optim.lr_scheduler.OneCycleLR(
         latent_optimizer,
-        max_lr=1e-4,
+        max_lr=latent_lr,  # Use parameter
         total_steps=scheduler_max_steps,  # Use buffered steps
         pct_start=0.1,  # Slightly longer warmup
         div_factor=5.0,  # min_lr = max_lr / div_factor
@@ -286,7 +295,18 @@ def train_models_parallel(
         simple_scheduler,
         latent_optimizer,
         latent_scheduler,
-    ) = setup_models_training(simple_model, latent_model, device, max_steps)
+    ) = setup_models_training(\
+        simple_model,\
+        latent_model,\
+        device,\
+        max_steps,\
+        # Pass default values for now; these will be varied by grid search\
+        # We might get these from args or a config in the grid search setup\
+        simple_lr=3e-4,  # Default from original setup\
+        simple_wd=0.03,  # Default from original setup\
+        latent_lr=1e-4,  # Default from original setup\
+        latent_wd=0.01,  # Default from original setup\
+    )
 
     # Gradient monitoring parameters - much more conservative for larger models
     MAX_GRAD_NORM = {

@@ -18,7 +18,7 @@ from src.SummaryWriter import SummaryWriter
 from tqdm import tqdm
 import itertools
 from contextlib import nullcontext
-from transformers import get_cosine_schedule_with_warmup
+from transformers import get_cosine_schedule_with_warmup, get_linear_schedule_with_warmup
 from src.Metrics import evaluate
 from src.Losses import SequenceAccuracyLoss
 from src.Training import generate_evaluation_examples, setup_models_training, set_seed
@@ -139,11 +139,9 @@ def train_models_parallel(
     dataset,
     dataset_val,
     vocab_size,
-    criterion,
     device,
     max_steps,
     batch_size,
-    learning_rate,
     writer=None,
     config=None,
     args=None,
@@ -151,7 +149,13 @@ def train_models_parallel(
     start_step=0,
     simple_checkpoint=None,
     latent_checkpoint=None,
-    log_dir="runs/parallel_comparison"
+    log_dir="runs/parallel_comparison",
+    simple_lr=None,
+    simple_wd=None,
+    latent_lr=None,
+    latent_wd=None,
+    warmup_steps=None,
+    bottleneck_factor=None
 ):
     """
     Train both models in parallel and compare performance
@@ -161,19 +165,23 @@ def train_models_parallel(
     dataset (ArithmeticDataset): Dataset for training
     dataset_val (ArithmeticDataset): Dataset for validation
     vocab_size (int): Size of the vocabulary
-    criterion (callable): Loss function
     device (torch.device): Device to train on
     max_steps (int): Maximum number of training steps (total, not additional)
     batch_size (int): Batch size
-    learning_rate (float): Learning rate
     writer (SummaryWriter, optional): TensorBoard writer
     config (Config, optional): Configuration object
     args (argparse.Namespace, optional): Command line arguments
     models_params (dict, optional): Dictionary with 'simple' and 'latent' keys containing parameter counts
-    start_step (int, optional): Starting step for resumed training
+    start_step (int, optional): Overall starting step (max from checkpoints)
     simple_checkpoint (dict, optional): Checkpoint for SimpleTransformer
     latent_checkpoint (dict, optional): Checkpoint for LatentTransformer
     log_dir (str, optional): Directory for saving logs and checkpoints
+    simple_lr (float, optional): Max learning rate for SimpleTransformer OneCycleLR scheduler
+    simple_wd (float, optional): Weight decay for SimpleTransformer AdamW optimizer
+    latent_lr (float, optional): Max learning rate for LatentTransformer OneCycleLR scheduler
+    latent_wd (float, optional): Weight decay for LatentTransformer AdamW optimizer
+    warmup_steps (int, optional): Number of warmup steps for scheduler
+    bottleneck_factor (float, optional): LatentTransformer bottleneck factor
     """
     # Create log directories for each model
     log_dir_simple = os.path.join(log_dir, "simple")
@@ -256,35 +264,36 @@ def train_models_parallel(
     if not config:
         from src.config import Config
         config = Config()
-        config.base_lr = learning_rate or 3e-4
+        config.base_lr = simple_lr or 3e-4
         config.warmup_steps = 100
-        config.weight_decay = 0.01
+        config.weight_decay = simple_wd or 0.01
     
-    # SimpleTransformer: Standard Adam optimizer
-    simple_optimizer = torch.optim.Adam(
-        simple_model.parameters(),
-        lr=config.base_lr,
-        weight_decay=config.weight_decay,
+    # Allow overriding these parameters from the grid search
+    _simple_lr = simple_lr if simple_lr is not None else args.simple_lr
+    _simple_wd = simple_wd if simple_wd is not None else args.weight_decay
+    _latent_lr = latent_lr if latent_lr is not None else args.latent_lr
+    _latent_wd = latent_wd if latent_wd is not None else args.weight_decay
+    _warmup_steps = warmup_steps if warmup_steps is not None else args.warmup_steps
+    
+    # Set up optimizers and schedulers
+    # SimpleTransformer optimizer and scheduler
+    simple_optimizer = torch.optim.AdamW(models['simple'].parameters(), lr=_simple_lr, 
+                                        weight_decay=_simple_wd)
+    
+    simple_scheduler = get_linear_schedule_with_warmup(
+        simple_optimizer, 
+        num_warmup_steps=_warmup_steps, 
+        num_training_steps=max_steps
     )
     
-    # LatentTransformer: Also Adam but with slightly lower weight decay for better exploration
-    latent_optimizer = torch.optim.Adam(
-        latent_model.parameters(),
-        lr=config.base_lr,
-        weight_decay=config.weight_decay * 0.9,  # Slightly reduced
-    )
+    # LatentTransformer optimizer and scheduler
+    latent_optimizer = torch.optim.AdamW(models['latent'].parameters(), lr=_latent_lr,
+                                        weight_decay=_latent_wd)
     
-    # Create learning rate schedulers 
-    simple_scheduler = get_cosine_schedule_with_warmup(
-        simple_optimizer,
-        num_warmup_steps=config.warmup_steps,
-        num_training_steps=max_steps + simple_start_step,  # Add the start_step to account for resumed training
-    )
-    
-    latent_scheduler = get_cosine_schedule_with_warmup(
-        latent_optimizer,
-        num_warmup_steps=config.warmup_steps,
-        num_training_steps=max_steps + latent_start_step,  # Add the start_step to account for resumed training
+    latent_scheduler = get_linear_schedule_with_warmup(
+        latent_optimizer, 
+        num_warmup_steps=_warmup_steps, 
+        num_training_steps=max_steps
     )
     
     # Setup learning rate trackers to ensure consistency
@@ -336,14 +345,14 @@ def train_models_parallel(
         # Log if we're using args-provided values
         logger.info(f"Using teacher forcing parameters from args: schedule={tf_schedule}, start_step={tf_start_step}")
     
-    # Setup models dict
+    # Setup models dict (update optimizer and scheduler)
     models_dict = {
         "simple": {
             "name": "SimpleTransformer",
             "model": simple_model,
-            "optimizer": simple_optimizer,
-            "scheduler": simple_scheduler,
-            "criterion": criterion,
+            "optimizer": simple_optimizer, # Use the created optimizer
+            "scheduler": simple_scheduler, # Use the created scheduler
+            "criterion": None,
             "writer": simple_writer,
             "step": simple_start_step,
             "val_loss": float('inf'),
@@ -360,9 +369,9 @@ def train_models_parallel(
         "latent": {
             "name": "LatentTransformer",
             "model": latent_model,
-            "optimizer": latent_optimizer,
-            "scheduler": latent_scheduler,
-            "criterion": criterion,
+            "optimizer": latent_optimizer, # Use the created optimizer
+            "scheduler": latent_scheduler, # Use the created scheduler
+            "criterion": None,
             "writer": latent_writer,
             "step": latent_start_step,
             "val_loss": float('inf'),
@@ -379,10 +388,12 @@ def train_models_parallel(
     }
     
     # Check if criterion is None and provide a fallback
-    if criterion is None:
+    if models_dict["simple"]["criterion"] is None:
         logger.warning("Criterion is None! Creating default SequenceAccuracyLoss as fallback")
         fallback_criterion = SequenceAccuracyLoss()
         models_dict["simple"]["criterion"] = fallback_criterion
+    if models_dict["latent"]["criterion"] is None:
+        logger.warning("Criterion is None! Creating default SequenceAccuracyLoss as fallback")
         models_dict["latent"]["criterion"] = fallback_criterion
     
     # Load from checkpoints if provided

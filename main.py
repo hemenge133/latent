@@ -23,6 +23,7 @@ import math
 import glob
 import logging
 from loguru import logger  # Replace standard logging with loguru
+import itertools # Add import for product
 
 from src.Dataset import MultiplicationDataset
 from src.Utils import collate_fn
@@ -197,9 +198,15 @@ def main():
 
     # Model architecture parameters
     parser.add_argument("--d-model", type=int, default=384, help="Model dimension")
+    parser.add_argument(
+        "--nhead", type=int, default=8, help="Number of attention heads (must divide d_model)"
+    )
     parser.add_argument("--num-layers", type=int, default=4, help="Number of layers")
     parser.add_argument(
         "--num-latent", type=int, default=8, help="Number of latent tokens"
+    )
+    parser.add_argument(
+        "--dropout", type=float, default=0.25, help="Dropout probability"
     )
 
     # Dataset parameters
@@ -211,9 +218,16 @@ def main():
     )
 
     # Training parameters
-    parser.add_argument("--batch-size", type=int, default=256, help="Batch size")
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
     parser.add_argument(
         "--max-steps", type=int, default=10000, help="Maximum training steps"
+    )
+    parser.add_argument(
+        "--warmup-steps", type=int, default=200, help="Number of warmup steps for learning rate scheduler"
+    )
+    parser.add_argument(
+        "--bottleneck-factor", type=float, default=1.0, 
+        help="Factor for LatentTransformer bottleneck (0.0-1.0, where 1.0 is pure latent)"
     )
     parser.add_argument(
         "--accuracy-weight", type=float, default=0.5, help="Weight for accuracy in loss"
@@ -264,6 +278,12 @@ def main():
         help="Device to use for training",
     )
 
+    parser.add_argument(
+        "--grid-search",
+        action="store_true",
+        help="Perform grid search over specified hyperparameters.",
+    )
+
     args = parser.parse_args()
 
     # Set seed for reproducibility and ensure Dataset uses the same seed
@@ -276,10 +296,10 @@ def main():
     config = TrainingConfig()
 
     # Override config for stability and to reduce overfitting
-    config.base_lr = 3e-4  # Standard learning rate
+    config.base_lr = 3e-4  # Standard learning rate (will be overridden in grid search if enabled)
     config.max_grad_norm = 0.5  # Reduced gradient clipping for stability
     config.warmup_steps = 200  # Extended warmup period
-    config.weight_decay = 0.04  # Increased weight decay to fight overfitting
+    config.weight_decay = 0.04  # Increased weight decay (will be overridden in grid search if enabled)
 
     # Determine device
     if args.device == "auto":
@@ -298,125 +318,73 @@ def main():
     accuracy_weight = args.accuracy_weight
     logger.info(f"Using {criterion_type} with accuracy weight: {accuracy_weight}")
 
-    # --- Checkpoint Loading and Parameter Determination --- 
+    # --- Define Hyperparameter Grid ---
+    # Smaller grid for 1-digit proof-of-concept
+    param_grid = {
+        # Optimizer/Scheduler HPs (fixed for this small test)
+        "simple_lr": [3e-4],
+        "simple_wd": [0.03],
+        "latent_lr": [1e-4],
+        "latent_wd": [0.01],
+        # Model Architecture HPs (small configurations)
+        "d_model": [128],
+        "nhead": [4],              # Fixed, divides 64 and 128
+        "num_layers": [2],         # Fixed at 2 layers
+        "dropout": [0.1],          # Fixed low dropout
+        "num_latent": [2, 4],      # Two options for latent tokens
+        # New parameters to test
+        "batch_size": [32, 64],    # Batch size options
+        "bottleneck_factor": [0.8, 1.0],  # Bottleneck factor options
+        "warmup_steps": [100, 200],  # Warmup steps options
+    }
+    logger.info(f"Using grid search with extended parameters: {param_grid}")
+
+    # Generate all combinations of hyperparameters
+    keys, values = zip(*param_grid.items())
+    # Filter combinations where d_model % nhead != 0
+    hyperparameter_combinations = []
+    for v in itertools.product(*values):
+        params = dict(zip(keys, v))
+        if params["d_model"] % params["nhead"] == 0:
+            hyperparameter_combinations.append(params)
+        else:
+            logger.warning(f"Skipping invalid combination: d_model={params['d_model']}, nhead={params['nhead']}")
+
+    if not hyperparameter_combinations:
+        logger.error("No valid hyperparameter combinations found after filtering (d_model % nhead). Check param_grid.")
+        sys.exit(1)
+
+    # Initialize trackers for best params independently
+    best_simple_metric = float("inf") 
+    best_simple_params = None
+    best_latent_metric = float("inf") # Renamed from best_metric
+    best_latent_params = None # Renamed from best_params
+    all_results = []
+
+    # --- Checkpoint Loading and Parameter Determination (modified for grid search) ---
+    # Checkpoint loading logic might need adjustment if searching d_model/num_layers
+    # For now, assume we resume with the *first* parameter set or CLI defaults
+    # This part needs careful consideration if resuming within a grid search
     simple_checkpoint = None
     latent_checkpoint = None
     simple_checkpoint_path = "checkpoints/simpletransformer/simpletransformer_latest.pt"
     latent_checkpoint_path = "checkpoints/latenttransformer/latenttransformer_latest.pt"
     start_step = 0
+    resume_run = args.resume # Store original resume flag
 
-    # Initialize final parameters with command-line args
+    # Initial parameter determination (primarily for non-grid search or first run)
     final_d_model = args.d_model
     final_num_layers = args.num_layers
     final_num_latent = args.num_latent
 
-    if args.resume:
-        logger.info("Resume flag is set. Attempting to load checkpoints...")
-        # Try loading both checkpoints first
-        if os.path.exists(simple_checkpoint_path):
-            try:
-                simple_checkpoint = torch.load(simple_checkpoint_path, map_location=device)
-                logger.info(f"Successfully loaded SimpleTransformer checkpoint from {simple_checkpoint_path}")
-            except Exception as e:
-                logger.error(f"Failed to load SimpleTransformer checkpoint from {simple_checkpoint_path}: {e}")
-                simple_checkpoint = None # Ensure it's None if loading failed
-        else:
-            logger.warning(f"SimpleTransformer checkpoint not found at {simple_checkpoint_path}")
-            
-        if os.path.exists(latent_checkpoint_path):
-            try:
-                latent_checkpoint = torch.load(latent_checkpoint_path, map_location=device)
-                logger.info(f"Successfully loaded LatentTransformer checkpoint from {latent_checkpoint_path}")
-            except Exception as e:
-                logger.error(f"Failed to load LatentTransformer checkpoint from {latent_checkpoint_path}: {e}")
-                latent_checkpoint = None
-        else:
-             logger.warning(f"LatentTransformer checkpoint not found at {latent_checkpoint_path}")
-
-        # Extract dimensions and determine final parameters based on Simple checkpoint
-        if simple_checkpoint:
-            simple_dims = extract_model_dimensions(simple_checkpoint)
-            start_step = max(start_step, simple_checkpoint.get('step', 0))
-            
-            # Override d_model and num_layers ONLY from simple checkpoint if valid
-            if simple_dims['d_model'] is not None:
-                if args.force_config:
-                     logger.warning(f"--force-config is set. Ignoring d_model={simple_dims['d_model']} from simple checkpoint, using CLI value {args.d_model}.")
-                elif simple_dims['d_model'] != args.d_model:
-                     logger.warning(f"Overriding CLI d_model={args.d_model} with value from simple checkpoint: {simple_dims['d_model']}")
-                     final_d_model = simple_dims['d_model']
-                else:
-                     final_d_model = args.d_model # Keep CLI value if consistent
-            else:
-                 logger.warning("Could not extract d_model from simple checkpoint, using CLI value.")
-                 final_d_model = args.d_model
-
-            if simple_dims['num_layers'] is not None:
-                 if args.force_config:
-                      logger.warning(f"--force-config is set. Ignoring num_layers={simple_dims['num_layers']} from simple checkpoint, using CLI value {args.num_layers}.")
-                 elif simple_dims['num_layers'] != args.num_layers:
-                      logger.warning(f"Overriding CLI num_layers={args.num_layers} with value from simple checkpoint: {simple_dims['num_layers']}")
-                      final_num_layers = simple_dims['num_layers']
-                 else:
-                      final_num_layers = args.num_layers
-            else:
-                 logger.warning("Could not extract num_layers from simple checkpoint, using CLI value.")
-                 final_num_layers = args.num_layers
-        else:
-             # If no simple checkpoint, use CLI args for d_model and num_layers
-             logger.info("No simple checkpoint loaded. Using CLI values for d_model and num_layers.")
-             final_d_model = args.d_model
-             final_num_layers = args.num_layers
-
-        # Extract dimensions and determine final num_latent based on Latent checkpoint
-        if latent_checkpoint:
-             latent_dims = extract_model_dimensions(latent_checkpoint)
-             start_step = max(start_step, latent_checkpoint.get('step', 0))
-
-             # Override num_latent ONLY from latent checkpoint if valid
-             if latent_dims['num_latent'] is not None:
-                  if args.force_config:
-                       logger.warning(f"--force-config is set. Ignoring num_latent={latent_dims['num_latent']} from latent checkpoint, using CLI value {args.num_latent}.")
-                  elif latent_dims['num_latent'] != args.num_latent:
-                       logger.warning(f"Overriding CLI num_latent={args.num_latent} with value from latent checkpoint: {latent_dims['num_latent']}")
-                       final_num_latent = latent_dims['num_latent']
-                  else:
-                       final_num_latent = args.num_latent
-             else:
-                  logger.warning("Could not extract num_latent from latent checkpoint, using CLI value.")
-                  final_num_latent = args.num_latent
-             
-             # Check for d_model consistency (Latent vs Final determined above)
-             if latent_dims['d_model'] is not None and latent_dims['d_model'] != final_d_model:
-                 logger.warning(f"d_model mismatch! Latent checkpoint suggests {latent_dims['d_model']}, but using {final_d_model} (from simple checkpoint/CLI).")
-             # Check for num_layers consistency
-             if latent_dims['num_layers'] is not None and latent_dims['num_layers'] != final_num_layers:
-                  logger.warning(f"num_layers mismatch! Latent checkpoint suggests {latent_dims['num_layers']}, but using {final_num_layers} (from simple checkpoint/CLI).")
-        else:
-             # If no latent checkpoint, use CLI arg for num_latent
-             logger.info("No latent checkpoint loaded. Using CLI value for num_latent.")
-             final_num_latent = args.num_latent
-             
-    else:
-         logger.info("Resume flag not set. Starting training from scratch.")
-         # Use CLI args directly when not resuming
-         final_d_model = args.d_model
-         final_num_layers = args.num_layers
-         final_num_latent = args.num_latent
-
-    # --- End Checkpoint Loading and Parameter Determination ---
-
-    # >>> MOVE DATASET LOADING HERE <<<
+    # >>> MOVE DATASET LOADING HERE <<< (Already moved in original code)
     # Dataset configuration
     min_digits = args.min_digits
     max_digits = args.max_digits
     min_val = 10 ** (min_digits - 1)
     max_val = 10**max_digits - 1
 
-    # Create datasets
-    logger.info(f"Using train dataset with range {min_val}-{max_val}")
-    # Ensure dataset seed is set correctly if needed by MultiplicationDataset
-    # MultiplicationDataset.set_fixed_seed(args.seed)
+    logger.info(f"Loading datasets...")
     train_dataset = MultiplicationDataset(
         num_samples=20000, # Consider making this configurable
         split="train",
@@ -424,8 +392,6 @@ def main():
         min_value=min_val,
         max_value=max_val,
     )
-
-    logger.info(f"Using val dataset with range {min_val}-{max_val}")
     val_dataset = MultiplicationDataset(
         num_samples=2000, # Consider making this configurable
         split="val",
@@ -433,86 +399,347 @@ def main():
         min_value=min_val,
         max_value=max_val,
     )
-    # >>> END MOVE DATASET LOADING <<<
-
-    # Get vocab size after dataset loading
     vocab_size = train_dataset.vocab_size
-    logger.info(f"Using vocabulary size: {vocab_size}")
-    
-    # Set seed for reproducibility before creating models
-    set_seed(args.seed)
+    logger.info(f"Datasets loaded. Vocabulary size: {vocab_size}")
 
-    # Log the final parameters that will be used for model creation
-    logger.info(f"Final model creation parameters: d_model={final_d_model}, num_layers={final_num_layers}, num_latent={final_num_latent}")
 
-    # Create the models with the determined parameters
-    logger.info(f"Creating SimpleTransformer with d_model={final_d_model}, num_layers={final_num_layers}")
-    simple_transformer = StableSimpleTransformer(
-        vocab_size=vocab_size,
-        d_model=final_d_model,
-        nhead=8,
-        num_layers=final_num_layers,
-        dropout=0.25,
-    ).to(device)
-    
-    logger.info(f"Creating LatentTransformer with d_model={final_d_model}, num_layers={final_num_layers}, num_latent={final_num_latent}")
-    latent_transformer = StableLatentTransformer(
-        vocab_size=vocab_size,
-        d_model=final_d_model,
-        nhead=8,
-        num_layers=final_num_layers,
-        num_latent=final_num_latent,
-        dropout=0.25,
-    ).to(device)
+    # --- Grid Search Loop or Single Run ---
+    if args.grid_search:
+        logger.info(f"Starting grid search over {len(hyperparameter_combinations)} combinations...")
+        # Disable resuming within the grid search loop for simplicity
+        # Individual runs within the search start from scratch
+        if resume_run:
+             logger.warning("Resuming is disabled when performing grid search. Each combination will start training from scratch.")
+             resume_run = False # Disable resume for the loop
 
-    # Compile models if possible
-    # ... (existing compile logic) ...
+        for i, params in enumerate(hyperparameter_combinations):
+            logger.info(f"--- Grid Search Run {i+1}/{len(hyperparameter_combinations)} ---")
+            logger.info(f"Parameters: {params}")
 
-    # Print model parameter counts
-    simple_params_count = sum(p.numel() for p in simple_transformer.parameters())
-    latent_params_count = sum(p.numel() for p in latent_transformer.parameters())
-    logger.info(f"SimpleTransformer has {simple_params_count:,} parameters")
-    logger.info(f"LatentTransformer has {latent_params_count:,} parameters")
+            # Set seed for this specific run
+            run_seed = seed + i # Offset seed for different runs
+            set_seed(run_seed)
+            MultiplicationDataset.set_fixed_seed(run_seed) # Reset dataset seed too
 
-    # --- Pass Checkpoints and Start Step to Training Loop --- 
-    # Ensure the correct start_step (max of loaded checkpoints) is used
-    logger.info(f"Passing start_step={start_step} to training loop.")
+            # Extract model and training params from the grid
+            current_d_model = params['d_model'] # Use directly from grid
+            current_nhead = params['nhead']
+            current_num_layers = params['num_layers']
+            current_dropout = params['dropout']
+            current_num_latent = params['num_latent']
+            current_batch_size = params.get('batch_size', args.batch_size)  # New parameter
+            current_bottleneck_factor = params.get('bottleneck_factor', 1.0)  # New parameter
+            current_warmup_steps = params.get('warmup_steps', 200)  # New parameter
 
-    # Flush logs before training
-    logger.info("Flushing logs before starting training loop...")
-    sys.stdout.flush()
-    sys.stderr.flush()
+            # Create models for this run
+            logger.info(f"Creating models for this run: d_model={current_d_model}, nhead={current_nhead}, "
+                       f"layers={current_num_layers}, dropout={current_dropout}, latent={current_num_latent}, "
+                       f"bottleneck={current_bottleneck_factor}, batch_size={current_batch_size}, "
+                       f"warmup_steps={current_warmup_steps}")
+            
+            simple_transformer = StableSimpleTransformer(
+                vocab_size=vocab_size,
+                d_model=current_d_model,
+                nhead=current_nhead,
+                num_layers=current_num_layers,
+                dropout=current_dropout,
+            ).to(device)
 
-    # Define log directory for TensorBoard
-    log_dir = "runs/parallel_comparison"
-    
-    results = train_models_parallel(
-        models={"simple": simple_transformer, "latent": latent_transformer},
-        dataset=train_dataset,
-        dataset_val=val_dataset,
-        vocab_size=vocab_size,
-        criterion=None, # Let TrainingLoop handle criterion creation
-        device=device,
-        max_steps=args.max_steps,
-        batch_size=args.batch_size,
-        learning_rate=config.base_lr if config else 0.001, # Pass a base LR
-        writer=None, # Let TrainingLoop handle writers
-        config=config, # Pass config object
-        args=args, # Pass args
-        models_params={"simple": simple_params_count, "latent": latent_params_count},
-        start_step=start_step, # Use the determined start step
-        simple_checkpoint=simple_checkpoint, # Pass loaded checkpoint data
-        latent_checkpoint=latent_checkpoint, # Pass loaded checkpoint data
-        log_dir=log_dir # Pass log directory
-    )
+            latent_transformer = StableLatentTransformer(
+                vocab_size=vocab_size,
+                d_model=current_d_model,
+                nhead=current_nhead,
+                num_layers=current_num_layers,
+                num_latent=current_num_latent,
+                dropout=current_dropout,
+                bottleneck_factor=current_bottleneck_factor  # Use from grid
+            ).to(device)
 
-    # Flush logs after training
-    logger.info("Flushing logs after training loop completion...")
-    sys.stdout.flush()
-    sys.stderr.flush()
+            simple_params_count = sum(p.numel() for p in simple_transformer.parameters())
+            latent_params_count = sum(p.numel() for p in latent_transformer.parameters())
+            logger.info(f"Simple Params: {simple_params_count:,}, Latent Params: {latent_params_count:,}")
 
-    # Print comparison
-    # ... (existing comparison logic) ...
+            # Define unique log directory for this run
+            param_str = "_".join([f"{k}{v}" for k, v in params.items()])
+            log_dir = f"runs/grid_search/{param_str}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            logger.info(f"Logging to: {log_dir}")
+
+            # Train with current hyperparameters
+            try:
+                 # Pass hyperparameters directly to train_models_parallel
+                 # Also pass the current model parameters
+                 results = train_models_parallel(
+                     models={"simple": simple_transformer, "latent": latent_transformer},
+                     dataset=train_dataset,
+                     dataset_val=val_dataset,
+                     vocab_size=vocab_size,
+                     device=device,
+                     max_steps=args.max_steps,
+                     batch_size=current_batch_size,  # Use from grid
+                     config=config,
+                     args=args,
+                     models_params={"simple": simple_params_count, "latent": latent_params_count},
+                     start_step=0,
+                     simple_checkpoint=None,
+                     latent_checkpoint=None,
+                     log_dir=log_dir,
+                     # Pass the hyperparameters from the grid
+                     simple_lr=params.get("simple_lr", config.base_lr),
+                     simple_wd=params.get("simple_wd", config.weight_decay),
+                     latent_lr=params.get("latent_lr", config.base_lr),
+                     latent_wd=params.get("latent_wd", config.weight_decay),
+                     warmup_steps=current_warmup_steps,  # New parameter
+                     bottleneck_factor=current_bottleneck_factor,  # New parameter
+                 )
+
+                 # Store results (e.g., final validation loss and accuracy for BOTH models)
+                 # First, log the full results structure for debugging purposes
+                 logger.info(f"Results structure: {results.keys()}")
+                 
+                 # The train_models_parallel function returns a dictionary with the
+                 # structure: { "simple": {...}, "latent": {...}, "training_time": value }
+                 
+                 # For SimpleTransformer:
+                 simple_final_val_loss = results.get("simple", {}).get("loss", float('inf'))
+                 simple_final_val_acc = results.get("simple", {}).get("sequence_accuracy", 0.0)
+                 
+                 # For LatentTransformer:
+                 latent_final_val_loss = results.get("latent", {}).get("loss", float('inf'))
+                 latent_final_val_acc = results.get("latent", {}).get("sequence_accuracy", 0.0)
+                 
+                 # Log detailed structure if we couldn't find the expected metrics
+                 if simple_final_val_loss == float('inf') or latent_final_val_loss == float('inf'):
+                     logger.warning("Could not find expected metrics in the standard structure!")
+                     logger.warning(f"Full results object: {results}")
+
+                 current_run_result = {
+                     "params": params,
+                     "simple_final_val_loss": simple_final_val_loss,
+                     "simple_final_val_accuracy": simple_final_val_acc,
+                     "latent_final_val_loss": latent_final_val_loss,
+                     "latent_final_val_accuracy": latent_final_val_acc,
+                     "log_dir": log_dir
+                 }
+                 all_results.append(current_run_result)
+                 logger.info(f"Run {i+1} finished. Simple [Loss: {simple_final_val_loss:.6f}, Acc: {simple_final_val_acc:.2%}], Latent [Loss: {latent_final_val_loss:.6f}, Acc: {latent_final_val_acc:.2%}]")
+
+                 # Update best parameters independently
+                 if simple_final_val_loss < best_simple_metric:
+                     best_simple_metric = simple_final_val_loss
+                     best_simple_params = params
+                     logger.info(f"*** New best SimpleTransformer validation loss found: {best_simple_metric:.6f} with params: {best_simple_params} ***")
+
+                 if latent_final_val_loss < best_latent_metric:
+                     best_latent_metric = latent_final_val_loss
+                     best_latent_params = params
+                     logger.info(f"*** New best LatentTransformer validation loss found: {best_latent_metric:.6f} with params: {best_latent_params} ***")
+
+            except Exception as e:
+                 logger.error(f"Error during grid search run {i+1} with params {params}: {e}")
+                 logger.error(traceback.format_exc())
+                 all_results.append({
+                     "params": params,
+                     "simple_final_val_loss": float('inf'), # Mark error runs
+                     "simple_final_val_accuracy": 0.0,
+                     "latent_final_val_loss": float('inf'),
+                     "latent_final_val_accuracy": 0.0,
+                     "log_dir": log_dir,
+                     "error": str(e)
+                 })
+
+        # --- End of Grid Search Loop ---
+        logger.info("--- Grid Search Complete ---")
+        logger.info(f"Best SimpleTransformer validation loss found: {best_simple_metric:.6f}")
+        logger.info(f"Best SimpleTransformer hyperparameters: {best_simple_params}")
+        logger.info(f"Best LatentTransformer validation loss found: {best_latent_metric:.6f}")
+        logger.info(f"Best LatentTransformer hyperparameters: {best_latent_params}")
+
+        # Save results
+        results_file = f"grid_search_results_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        with open(results_file, 'w') as f:
+            json.dump(all_results, f, indent=4)
+        logger.info(f"Grid search results saved to {results_file}")
+
+    else:
+        # --- Standard Single Run ---
+        logger.info("Starting standard single training run...")
+
+        # Handle checkpoint loading for single run
+        if resume_run:
+             logger.info("Attempting to resume training...")
+             # (Existing checkpoint loading logic based on resume_run flag)
+             # Try loading both checkpoints first
+             if os.path.exists(simple_checkpoint_path):
+                 try:
+                     simple_checkpoint = torch.load(simple_checkpoint_path, map_location=device)
+                     logger.info(f"Successfully loaded SimpleTransformer checkpoint from {simple_checkpoint_path}")
+                 except Exception as e:
+                     logger.error(f"Failed to load SimpleTransformer checkpoint from {simple_checkpoint_path}: {e}")
+                     simple_checkpoint = None # Ensure it's None if loading failed
+             else:
+                 logger.warning(f"SimpleTransformer checkpoint not found at {simple_checkpoint_path}")
+                 
+             if os.path.exists(latent_checkpoint_path):
+                 try:
+                     latent_checkpoint = torch.load(latent_checkpoint_path, map_location=device)
+                     logger.info(f"Successfully loaded LatentTransformer checkpoint from {latent_checkpoint_path}")
+                 except Exception as e:
+                     logger.error(f"Failed to load LatentTransformer checkpoint from {latent_checkpoint_path}: {e}")
+                     latent_checkpoint = None
+             else:
+                 logger.warning(f"LatentTransformer checkpoint not found at {latent_checkpoint_path}")
+
+             # Extract dimensions and determine final parameters based on Simple checkpoint
+             if simple_checkpoint:
+                 simple_dims = extract_model_dimensions(simple_checkpoint)
+                 start_step = max(start_step, simple_checkpoint.get('step', 0))
+                 
+                 # Override d_model and num_layers ONLY from simple checkpoint if valid
+                 if simple_dims['d_model'] is not None:
+                     if args.force_config:
+                         logger.warning(f"--force-config is set. Ignoring d_model={simple_dims['d_model']} from simple checkpoint, using CLI value {args.d_model}.")
+                         # Keep final_d_model as args.d_model
+                     elif simple_dims['d_model'] != args.d_model:
+                         logger.warning(f"Overriding CLI d_model={args.d_model} with value from simple checkpoint: {simple_dims['d_model']}")
+                         final_d_model = simple_dims['d_model']
+                     # else: keep final_d_model as args.d_model
+                 else:
+                     logger.warning("Could not extract d_model from simple checkpoint, using CLI value.")
+                     # Keep final_d_model as args.d_model
+
+                 if simple_dims['num_layers'] is not None:
+                     if args.force_config:
+                         logger.warning(f"--force-config is set. Ignoring num_layers={simple_dims['num_layers']} from simple checkpoint, using CLI value {args.num_layers}.")
+                         # Keep final_num_layers as args.num_layers
+                     elif simple_dims['num_layers'] != args.num_layers:
+                         logger.warning(f"Overriding CLI num_layers={args.num_layers} with value from simple checkpoint: {simple_dims['num_layers']}")
+                         final_num_layers = simple_dims['num_layers']
+                     # else: keep final_num_layers as args.num_layers
+                 else:
+                     logger.warning("Could not extract num_layers from simple checkpoint, using CLI value.")
+                     # Keep final_num_layers as args.num_layers
+             # else: Keep final_d_model/final_num_layers as args.d_model/args.num_layers if no simple checkpoint
+
+             # Extract dimensions and determine final num_latent based on Latent checkpoint
+             if latent_checkpoint:
+                 latent_dims = extract_model_dimensions(latent_checkpoint)
+                 start_step = max(start_step, latent_checkpoint.get('step', 0))
+
+                 # Override num_latent ONLY from latent checkpoint if valid
+                 if latent_dims['num_latent'] is not None:
+                     if args.force_config:
+                         logger.warning(f"--force-config is set. Ignoring num_latent={latent_dims['num_latent']} from latent checkpoint, using CLI value {args.num_latent}.")
+                         # Keep final_num_latent as args.num_latent
+                     elif latent_dims['num_latent'] != args.num_latent:
+                         logger.warning(f"Overriding CLI num_latent={args.num_latent} with value from latent checkpoint: {latent_dims['num_latent']}")
+                         final_num_latent = latent_dims['num_latent']
+                     # else: keep final_num_latent as args.num_latent
+                 else:
+                     logger.warning("Could not extract num_latent from latent checkpoint, using CLI value.")
+                     # Keep final_num_latent as args.num_latent
+                 
+                 # Check for d_model consistency (Latent vs Final determined above)
+                 if latent_dims['d_model'] is not None and latent_dims['d_model'] != final_d_model:
+                     logger.warning(f"d_model mismatch! Latent checkpoint suggests {latent_dims['d_model']}, but using {final_d_model} (determined by simple checkpoint/CLI).")
+                 # Check for num_layers consistency
+                 if latent_dims['num_layers'] is not None and latent_dims['num_layers'] != final_num_layers:
+                     logger.warning(f"num_layers mismatch! Latent checkpoint suggests {latent_dims['num_layers']}, but using {final_num_layers} (determined by simple checkpoint/CLI).")
+             # else: Keep final_num_latent as args.num_latent if no latent checkpoint
+             
+             logger.info(f"Resuming with parameters: d_model={final_d_model}, layers={final_num_layers}, latent={final_num_latent}, start_step={start_step}")
+
+        else: # if not resume_run
+             logger.info("Starting training from scratch (no resume).")
+             start_step = 0
+             # Use CLI args directly
+             final_d_model = args.d_model
+             final_num_layers = args.num_layers
+             final_num_latent = args.num_latent
+
+
+        # Log the final parameters that will be used for model creation
+        logger.info(f"Final model creation parameters (standard run): d_model={final_d_model}, nhead={args.nhead}, layers={final_num_layers}, dropout={args.dropout}")
+
+        # Create the models with the determined parameters
+        logger.info(f"Creating SimpleTransformer with d_model={final_d_model}, nhead={args.nhead}, num_layers={final_num_layers}, dropout={args.dropout}")
+        simple_transformer = StableSimpleTransformer(
+             vocab_size=vocab_size,
+             d_model=final_d_model,
+             nhead=args.nhead, # Use nhead from args
+             num_layers=final_num_layers,
+             dropout=args.dropout, # Use dropout from args
+        ).to(device)
+
+        logger.info(f"Creating LatentTransformer with d_model={final_d_model}, nhead={args.nhead}, num_layers={final_num_layers}, "
+                   f"dropout={args.dropout}, num_latent={final_num_latent}, bottleneck_factor={args.bottleneck_factor}")
+        latent_transformer = StableLatentTransformer(
+             vocab_size=vocab_size,
+             d_model=final_d_model,
+             nhead=args.nhead, # Use nhead from args
+             num_layers=final_num_layers,
+             num_latent=final_num_latent,
+             dropout=args.dropout, # Use dropout from args
+             bottleneck_factor=args.bottleneck_factor  # Use from args
+        ).to(device)
+
+        simple_params_count = sum(p.numel() for p in simple_transformer.parameters())
+        latent_params_count = sum(p.numel() for p in latent_transformer.parameters())
+        logger.info(f"SimpleTransformer has {simple_params_count:,} parameters")
+        logger.info(f"LatentTransformer has {latent_params_count:,} parameters")
+
+        # Define log directory for TensorBoard (standard run)
+        log_dir = "runs/parallel_comparison"
+        logger.info(f"Logging to: {log_dir}")
+
+        # --- Pass Checkpoints and Start Step to Training Loop ---
+        logger.info(f"Passing start_step={start_step} to training loop.")
+
+        # Flush logs before training
+        logger.info("Flushing logs before starting training loop...")
+        sys.stdout.flush()
+        sys.stderr.flush()
+
+        # Call training loop for the single run
+        results = train_models_parallel(
+            models={"simple": simple_transformer, "latent": latent_transformer},
+            dataset=train_dataset,
+            dataset_val=val_dataset,
+            vocab_size=vocab_size,
+            device=device,
+            max_steps=args.max_steps,
+            batch_size=args.batch_size,
+            config=config,
+            args=args,
+            models_params={"simple": simple_params_count, "latent": latent_params_count},
+            start_step=start_step, # Use the determined start step
+            simple_checkpoint=simple_checkpoint if resume_run else None,
+            latent_checkpoint=latent_checkpoint if resume_run else None,
+            log_dir=log_dir,
+            # Pass default hyperparameters (from config or args if overridden)
+            simple_lr=config.base_lr, # Use config or potentially args if you add LR/WD args later
+            simple_wd=config.weight_decay,
+            latent_lr=config.base_lr,
+            latent_wd=config.weight_decay,
+        )
+
+        # Flush logs after training
+        logger.info("Flushing logs after training loop completion...")
+        sys.stdout.flush()
+        sys.stderr.flush()
+
+        # Print comparison (assuming results dict contains necessary info)
+        # This part might need adjustment based on the return value of train_models_parallel
+        # logger.info("\n--- Training Complete ---")
+        # if results:
+        #      simple_final_loss = results.get("final_metrics", {}).get("simple", {}).get("val_loss", "N/A")
+        #      latent_final_loss = results.get("final_metrics", {}).get("latent", {}).get("val_loss", "N/A")
+        #      simple_final_acc = results.get("final_metrics", {}).get("simple", {}).get("val_accuracy", "N/A")
+        #      latent_final_acc = results.get("final_metrics", {}).get("latent", {}).get("val_accuracy", "N/A")
+        #      logger.info(f"SimpleTransformer Final Val Loss: {simple_final_loss}, Accuracy: {simple_final_acc}")
+        #      logger.info(f"LatentTransformer Final Val Loss: {latent_final_loss}, Accuracy: {latent_final_acc}")
+        # else:
+        #      logger.warning("Training function did not return results.")
+
 
     # Finalize logging
     logger.info("Finalizing logging before exit...")

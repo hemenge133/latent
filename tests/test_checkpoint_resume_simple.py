@@ -152,12 +152,14 @@ def test_checkpoint_resume_simple():
         cmd = [
             "python", "main.py",
             "--d-model", "32",              # Small model size
+            "--nhead", "4",                 # Needs to divide d_model
             "--num-layers", "1",            # Single layer
+            "--dropout", "0.1",             # Set dropout
             "--num-latent", "2",            # Few latent tokens
             "--min-digits", "1",            # Single-digit multiplication (small problem)
             "--max-digits", "1",
             "--batch-size", "16",           # Small batch size
-            "--max-steps", "10",            # Fixed value: Just 10 steps 
+            "--max-steps", "10",            # Fixed value: Just 10 steps
             "--save-every", "10",           # Save only at the end (step 9 or 10)
             "--seed", "42"
         ]
@@ -226,7 +228,9 @@ def test_checkpoint_resume_simple():
                 "--run-id", initial_run_id,
                 # Explicitly pass parameters matching the initial run
                 "--d-model", "32",
+                "--nhead", "4",
                 "--num-layers", "1",
+                "--dropout", "0.1",
                 "--num-latent", "2",
                 "--min-digits", "1",
                 "--max-digits", "1",
@@ -237,7 +241,9 @@ def test_checkpoint_resume_simple():
             resume_cmd.insert(2, "--resume")
             resume_cmd.extend([
                 "--d-model", "32",
+                "--nhead", "4",
                 "--num-layers", "1",
+                "--dropout", "0.1",
                 "--num-latent", "2",
                 "--min-digits", "1",
                 "--max-digits", "1",

@@ -90,14 +90,16 @@ def test_training_basic():
         dataset=dataset,
         dataset_val=val_dataset,
         vocab_size=vocab_size,
-        criterion=criterion,
         device=device,
         max_steps=50,  # Just run for 50 steps
         batch_size=4,
-        learning_rate=3e-4,
         config=config,
         models_params=models_params,
-        start_step=0
+        start_step=0,
+        simple_lr=3e-4,
+        simple_wd=0.01,
+        latent_lr=1e-4,
+        latent_wd=0.01
     )
     
     # Verify that training completed and returned results
