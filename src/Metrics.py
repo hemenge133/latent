@@ -123,19 +123,13 @@ def improved_inference(model, inp, dataset, device, max_len=10, print_debug=Fals
             result = "0"
 
         if print_debug:
-            input_str = ""
-            if hasattr(dataset, "decode"):
-                # Try to decode the input tensor
-                try:
-                    input_str = dataset.decode(inp[0].cpu().numpy())
-                except:
-                    input_str = "[Decoding failed]"
-
-            print(f"\nInput: {input_str}")
-            print(
-                f"Tokens: {output_tokens} (probabilities: {[f'{p:.4f}' for p in token_probs]})"
-            )
-            print(f"Prediction: {result}")
+            # Get the original input string
+            input_str = dataset.decode(inp.squeeze().cpu().tolist())
+            # print(f"\nInput: {input_str}") # Commented out
+            # print( # Commented out
+            #     f"Tokens: {output_tokens} (probabilities: {[f'{p:.4f}' for p in token_probs]})" # Commented out
+            # ) # Commented out
+            # print(f"Prediction: {decoded_output}") # Commented out
 
         return result
 
@@ -185,8 +179,8 @@ def improved_accuracy(
                     correct += 1
 
                 if should_print:
-                    print(f"Problem: {a} * {b} = {expected_str}")
-                    print(f"Predicted: {pred} (Correct: {is_correct})")
+                    # print(f"Problem: {a} * {b} = {expected_str}") # Commented out
+                    # print(f"Predicted: {pred} (Correct: {is_correct})") # Commented out
                     if not is_correct:
                         # Show where the prediction is wrong
                         error_indices = []
@@ -194,12 +188,14 @@ def improved_accuracy(
                             if pred[i] != expected_str[i]:
                                 error_indices.append(i)
                         if len(pred) != len(expected_str):
-                            print(
-                                f"Length mismatch: Pred={len(pred)}, Expected={len(expected_str)}"
-                            )
+                            # print( # Commented out
+                            #     f"Length mismatch: Pred={len(pred)}, Expected={len(expected_str)}" # Commented out
+                            # ) # Commented out
+                            pass # Keep the block structure if needed
                         else:
-                            print(f"Errors at positions: {error_indices}")
-                    print("")
+                            # print(f"Errors at positions: {error_indices}") # Commented out
+                            pass # Keep the block structure if needed
+                    # print("") # Commented out
 
                 total += 1
             except Exception as e:
