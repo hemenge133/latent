@@ -61,3 +61,21 @@ ehthumbs.db
 Thumbs.db 
 *.json
 *.db
+
+# Environment tracking
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Shell scripts (except specific ones we want to keep)
+*.sh
+!install_dependencies.sh
+!run_tests.sh
+
+# Data files
+*.csv
+*.pkl
