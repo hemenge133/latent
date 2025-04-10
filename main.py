@@ -262,6 +262,67 @@ def main(args):
                         logger.info(f"Overrode {key}={value}")
         except Exception as e:
             logger.error(f"Failed to load best parameters from {args.use_best_params}: {e}")
+    
+    # Check if we should load best parameters directly from a study
+    if args.use_best_from_study:
+        try:
+            logger.info(f"Loading best parameters from study: {args.study_name}")
+            db_path = f"{args.study_name}.db"
+            storage_path = f"sqlite:///{db_path}"
+            
+            # Check if the database file exists
+            if not os.path.exists(db_path):
+                logger.error(f"Study database file '{db_path}' does not exist.")
+                logger.info(f"Run optimization first with: python main.py --optimize --study-name {args.study_name}")
+                if args.optimize:
+                    logger.info("Will create a new study since --optimize is specified.")
+                else:
+                    return
+            
+            try:
+                study = optuna.load_study(
+                    study_name=args.study_name,
+                    storage=storage_path
+                )
+                
+                # Check if study has any completed trials
+                completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+                if not completed_trials:
+                    logger.error(f"Study '{args.study_name}' exists but has no completed trials.")
+                    if args.optimize:
+                        logger.info("Continuing with optimization since --optimize is specified.")
+                    else:
+                        return
+                else:
+                    logger.info(f"Found {len(completed_trials)} completed trials in study.")
+                    logger.info(f"Best trial: #{study.best_trial.number} with value: {study.best_trial.value}")
+                    best_params = study.best_trial.params
+                    
+                    # Override args with loaded parameters
+                    for key, value in best_params.items():
+                        if hasattr(args, key):
+                            setattr(args, key, value)
+                            logger.info(f"Overrode {key}={value}")
+                    
+                    # Also save to a file for reference
+                    best_params_file = f"best_params_{args.study_name}_used.json"
+                    with open(best_params_file, 'w') as f:
+                        json.dump(best_params, f, indent=4)
+                    logger.info(f"Saved used parameters to {best_params_file}")
+            except ValueError as ve:
+                if "Record does not exist" in str(ve):
+                    logger.error(f"Study '{args.study_name}' exists but has no best trial data.")
+                    if args.optimize:
+                        logger.info("Continuing with optimization since --optimize is specified.")
+                    else:
+                        return
+                else:
+                    raise
+        except Exception as e:
+            logger.error(f"Failed to load best parameters from study {args.study_name}: {e}")
+            logger.error(traceback.format_exc())
+            if not args.optimize:
+                logger.info("If you meant to start a new optimization run, add the --optimize flag.")
 
     # Define objective function for Optuna
     def objective(trial):
@@ -323,8 +384,12 @@ def main(args):
             latent_params_count = sum(p.numel() for p in latent_transformer.parameters())
             logger.info(f"Simple Params: {simple_params_count:,}, Latent Params: {latent_params_count:,}")
 
-            # Define unique log directory for this trial
-            log_dir = f"runs/optuna_study_{args.study_name}/trial_{trial.number}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            # Define unique log directory for this trial, including key hyperparameters
+            param_str = (
+                f"d{current_d_model}_nl{current_num_layers}_nlt{current_num_latent}_bs{current_batch_size}_"
+                f"slr{simple_lr:.0e}_swd{simple_wd:.0e}_llr{latent_lr:.0e}_lwd{latent_wd:.0e}"
+            )
+            log_dir = f"runs/optuna_study_{args.study_name}/{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_trial_{trial.number}_{param_str}"
             logger.info(f"Logging to: {log_dir}")
 
             # Train with current hyperparameters
@@ -353,12 +418,31 @@ def main(args):
             )
             
             # Extract metrics for Optuna to optimize
+            # Note: "sequence_accuracy" here is the inference-based sequence accuracy,
+            # which measures the model's ability to solve problems from scratch without teacher forcing
             latent_final_val_acc = results.get("latent", {}).get("sequence_accuracy", 0.0)
             latent_final_val_loss = results.get("latent", {}).get("loss", float('inf'))
             
-            # Log trial results
-            logger.info(f"Trial {trial.number} finished. Latent model: Acc={latent_final_val_acc:.4f}, Loss={latent_final_val_loss:.6f}")
+            # Get the simple model results for comparison
+            simple_final_val_acc = results.get("simple", {}).get("sequence_accuracy", 0.0)
             
+            # Create a more detailed trial summary
+            logger.info(f"\n{'='*80}")
+            logger.info(f"TRIAL {trial.number} COMPLETED")
+            logger.info(f"{'='*80}")
+            logger.info(f"Latent model inference accuracy: {latent_final_val_acc:.4f}")
+            logger.info(f"Latent model validation loss: {latent_final_val_loss:.6f}")
+            logger.info(f"Simple model inference accuracy: {simple_final_val_acc:.4f}")
+            logger.info(f"Parameters:")
+            for param_name, param_value in trial.params.items():
+                logger.info(f"  {param_name}: {param_value}")
+            logger.info(f"{'='*80}")
+            
+            # Check if this is the best accuracy so far for this trial
+            if hasattr(trial, "study") and trial.study.best_value and latent_final_val_acc >= trial.study.best_value:
+                logger.info(f"NEW BEST TRIAL! Accuracy: {latent_final_val_acc:.4f}")
+            
+            logger.info(f"--- Objective function for Trial {trial.number} returning value: {latent_final_val_acc:.4f} ---")
             # Return metric to maximize (or negative loss to minimize)
             return latent_final_val_acc
             
@@ -374,6 +458,143 @@ def main(args):
     simple_checkpoint_path = "checkpoints/simpletransformer/simpletransformer_latest.pt"
     latent_checkpoint_path = "checkpoints/latenttransformer/latenttransformer_latest.pt"
     start_step = 0
+    
+    # Handle standalone study check or diagnosis first
+    if args.check_study or args.diagnose_study:
+        db_path = f"{args.study_name}.db"
+        storage_path = f"sqlite:///{db_path}"
+        if not os.path.exists(db_path):
+            logger.error(f"Database file {db_path} does not exist. Cannot check/diagnose.")
+            return
+        
+        study = optuna.load_study(study_name=args.study_name, storage=storage_path)
+        
+        if args.check_study:
+            logger.info(f"Checking progress of study: {args.study_name}")
+            completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+            logger.info(f"Total trials: {len(study.trials)}")
+            logger.info(f"Number of completed trials: {len(completed_trials)}")
+            
+            # Check if a best trial exists before accessing it
+            best_trial = None
+            try:
+                best_trial = study.best_trial
+            except ValueError: # Handles case where no completed trials exist
+                logger.info("No best trial found yet (likely no completed trials with a value).")
+            
+            if best_trial:
+                logger.info(f"Best trial number: {best_trial.number}")
+                logger.info(f"Best value: {best_trial.value}")
+                logger.info("Best hyperparameters:")
+                for key, value in best_trial.params.items():
+                    logger.info(f"    {key}: {value}")
+                # Save best parameters
+                best_params_file = f"best_params_{args.study_name}.json"
+                with open(best_params_file, 'w') as f:
+                    json.dump(best_trial.params, f, indent=4)
+                logger.info(f"Best parameters saved to {best_params_file}")
+            
+            # Export trial history to CSV regardless of best trial
+            if study.trials:
+                try:
+                    import pandas as pd
+                    trials_df = study.trials_dataframe()
+                    csv_file = f"{args.study_name}_trials.csv"
+                    trials_df.to_csv(csv_file)
+                    logger.info(f"Trial history exported to {csv_file}")
+                except Exception as e:
+                    logger.error(f"Failed to export trial history to CSV: {e}")
+            else:
+                logger.info("No trials found in the study to export.")
+                
+            return # Exit after checking study
+
+        if args.diagnose_study:
+            logger.info(f"Diagnosing study database: {args.study_name}.db")
+            db_path = f"{args.study_name}.db"
+            
+            if not os.path.exists(db_path):
+                logger.error(f"Database file {db_path} does not exist.")
+                return
+                
+            # Log file info
+            file_size = os.path.getsize(db_path)
+            logger.info(f"Database file size: {file_size} bytes")
+            
+            try:
+                # Try to directly access the SQLite database to list studies
+                import sqlite3
+                conn = sqlite3.connect(db_path)
+                cursor = conn.cursor()
+                
+                # Try to get study information
+                cursor.execute("SELECT study_id, study_name FROM studies")
+                studies = cursor.fetchall()
+                
+                if not studies:
+                    logger.info("No studies found in the database.")
+                else:
+                    logger.info(f"Found {len(studies)} studies in the database:")
+                    for study_id, study_name in studies:
+                        logger.info(f"  Study ID: {study_id}, Name: {study_name}")
+                        
+                        # Get trial information (ID and state) from the trials table
+                        cursor.execute(f"SELECT trial_id, state FROM trials WHERE study_id = {study_id}")
+                        trials_info = cursor.fetchall()
+                        
+                        if not trials_info:
+                            logger.info(f"    No trials found for study {study_name}")
+                        else:
+                            states = {}
+                            trial_values = {}
+                            for trial_id, state in trials_info:
+                                states[state] = states.get(state, 0) + 1
+                                # Query trial_values table separately for the objective value
+                                cursor.execute(f"SELECT value FROM trial_values WHERE trial_id = {trial_id}")
+                                value_result = cursor.fetchone()
+                                if value_result:
+                                    trial_values[trial_id] = value_result[0]
+                                
+                            logger.info(f"    Found {len(trials_info)} trials:")
+                            logger.info(f"    Trial states (0=RUNNING, 1=COMPLETE, 2=PRUNED, 3=FAIL, 4=WAITING): {states}")
+                            
+                            # Look for completed trials with values
+                            completed_ids_with_value = [tid for tid, state in trials_info if state == 1 and tid in trial_values]
+                            logger.info(f"    Completed trials with values: {len(completed_ids_with_value)}")
+                            
+                            if completed_ids_with_value:
+                                # Find best trial ID based on stored values
+                                best_trial_id = max(completed_ids_with_value, key=lambda tid: trial_values.get(tid, float('-inf')))
+                                best_value = trial_values.get(best_trial_id)
+                                logger.info(f"    Best trial: ID={best_trial_id}, Value={best_value}")
+                                
+                                # Get parameters for best trial
+                                cursor.execute(f"SELECT param_name, param_value FROM trial_params WHERE trial_id = {best_trial_id}")
+                                params = cursor.fetchall()
+                                if params:
+                                    logger.info(f"    Best trial parameters:")
+                                    for param_name, param_value in params:
+                                        # Attempt to convert JSON string params back
+                                        try:
+                                            param_value_parsed = json.loads(param_value)
+                                        except (json.JSONDecodeError, TypeError):
+                                            param_value_parsed = param_value # Keep as is if not JSON
+                                        logger.info(f"      {param_name}: {param_value_parsed}")
+                
+                conn.close()
+                
+                # If studies were found, suggest next steps
+                if studies:
+                    study_names = [name for _, name in studies]
+                    if args.study_name not in study_names:
+                        logger.warning(f"Study name '{args.study_name}' not found in database! Available studies: {study_names}")
+                        logger.info(f"Use one of these study names instead: {', '.join(study_names)}")
+                        
+            except Exception as e:
+                logger.error(f"Error diagnosing database: {e}")
+                logger.error(traceback.format_exc())
+                
+            return # Exit after diagnosing study
 
     # --- Optuna Optimization or Standard Training Run ---
     if args.optimize:
@@ -399,7 +620,15 @@ def main(args):
                 logger.error(f"Failed to load warm start parameters: {e}")
         
         # Run optimization
-        study.optimize(objective, n_trials=args.num_trials, timeout=args.timeout)
+        if args.indefinite:
+            logger.info("Starting indefinite optimization - will run until manually stopped")
+            logger.info(f"Study results are being saved to: {args.study_name}.db")
+            logger.info("You can check the current best parameters at any time in another terminal using:")
+            logger.info(f"  python -c \"import optuna; study = optuna.load_study(study_name='{args.study_name}', storage='sqlite:///{args.study_name}.db'); print('Best value:', study.best_value); print('Best params:', study.best_trial.params)\"")
+            study.optimize(objective, n_trials=None, timeout=args.timeout)
+        else:
+            logger.info(f"Starting optimization with {args.num_trials} trials")
+            study.optimize(objective, n_trials=args.num_trials, timeout=args.timeout)
         
         # Output best trial information
         logger.info("--- Optimization Complete ---")
@@ -415,6 +644,16 @@ def main(args):
             json.dump(study.best_trial.params, f, indent=4)
         logger.info(f"Best parameters saved to {best_params_file}")
         
+        # Export all trial results to CSV for analysis without TensorBoard
+        try:
+            import pandas as pd
+            trials_df = study.trials_dataframe()
+            csv_file = f"{args.study_name}_trials.csv"
+            trials_df.to_csv(csv_file)
+            logger.info(f"Trial history exported to {csv_file}")
+        except Exception as e:
+            logger.error(f"Failed to export trial history to CSV: {e}")
+            
     else:
         # --- Standard Single Training Run ---
         logger.info("Starting standard single training run...")
@@ -538,7 +777,18 @@ def main(args):
         logger.info(f"LatentTransformer has {latent_params_count:,} parameters")
 
         # Define log directory for TensorBoard (standard run)
-        log_dir = "runs/parallel_comparison"
+        # Include key hyperparameters in the log directory name
+        _simple_lr = args.simple_lr if hasattr(args, 'simple_lr') and args.simple_lr is not None else config.base_lr
+        _simple_wd = args.simple_wd if hasattr(args, 'simple_wd') and args.simple_wd is not None else config.weight_decay
+        _latent_lr = args.latent_lr if hasattr(args, 'latent_lr') and args.latent_lr is not None else config.base_lr
+        _latent_wd = args.latent_wd if hasattr(args, 'latent_wd') and args.latent_wd is not None else config.weight_decay
+        
+        param_str = (
+            f"d{args.d_model}_nl{args.num_layers}_nlt{args.num_latent}_bs{args.batch_size}_"
+            f"slr{_simple_lr:.0e}_swd{_simple_wd:.0e}_llr{_latent_lr:.0e}_lwd{_latent_wd:.0e}"
+        )
+        log_dir_base = "runs/standard_run"
+        log_dir = f"{log_dir_base}/{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{param_str}"
         logger.info(f"Logging to: {log_dir}")
 
         # --- Pass Checkpoints and Start Step to Training Loop ---
@@ -706,6 +956,21 @@ if __name__ == "__main__":
         type=str,
         help="JSON file with best parameters to use for single run",
     )
+    parser.add_argument(
+        "--use-best-from-study",
+        action="store_true",
+        help="Automatically use the best parameters from the study specified by --study-name",
+    )
+    parser.add_argument(
+        "--check-study",
+        action="store_true",
+        help="Check progress of an existing study and export results without running new trials",
+    )
+    parser.add_argument(
+        "--diagnose-study",
+        action="store_true",
+        help="Show detailed diagnostic information about studies and trials in the database",
+    )
 
     # Individual hyperparameters for non-optuna runs
     parser.add_argument(
@@ -721,6 +986,37 @@ if __name__ == "__main__":
         "--latent-wd", type=float, help="Weight decay for LatentTransformer"
     )
 
+    # New argument for indefinite optimization
+    parser.add_argument(
+        "--indefinite",
+        action="store_true",
+        help="Run optimization indefinitely until manually stopped",
+    )
+
+    # Clean option to remove all training and optimization artifacts
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        help="Clean all training runs, checkpoints, logs, and optimization artifacts",
+    )
+
     args = parser.parse_args()
+    
+    # Handle clean option
+    if args.clean:
+        import subprocess
+        import os
+        
+        print("Cleaning all training runs, checkpoints, logs, and optimization artifacts...")
+        
+        try:
+            # Run the clean_runs.sh script
+            clean_script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clean_runs.sh")
+            subprocess.run(["bash", clean_script_path], check=True)
+            print("Clean completed successfully.")
+            sys.exit(0)
+        except subprocess.CalledProcessError as e:
+            print(f"Error cleaning artifacts: {e}")
+            sys.exit(1)
     
     main(args)

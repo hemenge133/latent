@@ -227,78 +227,88 @@ def evaluate(
     criterion,
     dataset,
     device,
-    vocab_size,
     desc="Evaluating",
-    examples=None,
-    rotate_examples=False,
+    calculate_inference=True # Add flag to control inference calculation
 ):
-    """Evaluate a model on a data loader with loss and accuracy"""
+    """
+    Evaluate a model on a data loader with loss and accuracy metrics.
+    Calculate both teacher-forced metrics and optionally inference-based metrics
+    across the entire validation set.
+    """
     model.eval()
     total_loss = 0.0
-    total_sequence_accuracy = 0.0
+    total_teacher_forced_accuracy = 0.0
+    inference_correct = 0
+    inference_digit_correct = 0
+    total_digits = 0
     total_samples = 0
 
-    # If rotate_examples is True, we'll modify the validation examples
-    # to test on different number ranges
-    if examples and rotate_examples and len(examples) > 0:
-        # Create a few examples with larger numbers
-        try:
-            extra_examples = []
-            # Add examples with larger numbers to test generalization
-            for a in range(10, 20):  # Larger than typical validation examples
-                for b in range(10, 20):
-                    if len(extra_examples) >= 5:  # Just add a few
-                        break
-                    # Format input
-                    input_str = f"{a}*{b}"
-                    input_tokens = dataset.encode(input_str)
-                    input_tensor = torch.tensor([input_tokens], dtype=torch.long).to(
-                        device
-                    )
-
-                    # Format expected output
-                    result = a * b
-                    result_str = str(result)
-
-                    extra_examples.append((input_tensor, result_str, a, b))
-                if len(extra_examples) >= 5:
-                    break
-
-            # Replace some existing examples with the new ones
-            for i, ex in enumerate(extra_examples):
-                if i < len(examples):
-                    examples[i] = ex
-        except Exception as e:
-            print(f"Warning: Error creating extra validation examples: {e}")
-
     with torch.no_grad():
-        for inp, tgt, inp_lens, tgt_lens in tqdm(data_loader, desc=desc, leave=False):
+        for inp, tgt, inp_lens, tgt_lens in tqdm(data_loader, desc=desc, leave=False, ncols=80, position=0, ascii=True):
             inp, tgt = inp.to(device), tgt.to(device)
+            batch_size = inp.size(0)
+            
+            # Calculate teacher-forced metrics (always done)
             decoder_input = tgt[:, :-1]
             decoder_target = tgt[:, 1:]
-
             output = model(inp, decoder_input)
+            loss, tf_accuracy = criterion(output, decoder_target)
+            
+            total_loss += loss.item() * batch_size
+            total_teacher_forced_accuracy += tf_accuracy.item() * batch_size
+            
+            # Optionally calculate inference-based metrics
+            if calculate_inference:
+                for i in range(batch_size):
+                    single_inp = inp[i:i+1]
+                    
+                    # Extract expected output from target
+                    target_tokens = tgt[i].cpu().numpy()
+                    result_tokens = []
+                    start_found = False
+                    for token in target_tokens:
+                        if token == 0: continue
+                        if not start_found:
+                            if token == 1: start_found = True
+                            continue
+                        result_tokens.append(token)
+                    
+                    expected_str = ""
+                    for token in result_tokens:
+                        if 2 <= token <= 11:
+                            digit = token - 2
+                            expected_str += str(digit)
+                    expected_str = expected_str.lstrip("0")
+                    if not expected_str: expected_str = "0"
+                    
+                    pred = improved_inference(model, single_inp, dataset, device)
+                    
+                    min_len = min(len(pred), len(expected_str))
+                    for j in range(min_len):
+                        if pred[j] == expected_str[j]:
+                            inference_digit_correct += 1
+                    total_digits += max(len(pred), len(expected_str))
+                    
+                    if pred == expected_str:
+                        inference_correct += 1
+            
+            total_samples += batch_size
+    
+    # Calculate final metrics
+    avg_loss = total_loss / total_samples
+    teacher_forced_accuracy = total_teacher_forced_accuracy / total_samples
+    
+    # Return inference metrics only if calculated
+    if calculate_inference:
+        inference_sequence_accuracy = inference_correct / total_samples
+        inference_digit_accuracy = inference_digit_correct / total_digits if total_digits > 0 else 0.0
+    else:
+        inference_sequence_accuracy = None
+        inference_digit_accuracy = None
 
-            # Use the sequence accuracy loss for evaluation
-            loss, seq_accuracy = criterion(output, decoder_target)
-
-            total_loss += loss.item() * decoder_target.size(0)
-            total_sequence_accuracy += seq_accuracy.item() * decoder_target.size(0)
-            total_samples += decoder_target.size(0)
-
-    # Calculate accuracy if examples are provided
-    sequence_accuracy = 0.0
-    digit_accuracy = 0.0
-    if examples:
-        # Only print diagnostics during validation (not during final eval)
-        print_debug = "Val" in desc  # Only print during validation
-        sequence_accuracy, digit_accuracy = improved_accuracy(
-            model, examples, dataset, device, print_debug=print_debug
-        )
-
-    # Return validation loss and the two accuracy metrics
     return (
-        total_loss / max(1, total_samples),
-        total_sequence_accuracy / max(1, total_samples),
-        digit_accuracy,
+        avg_loss,
+        teacher_forced_accuracy,
+        inference_sequence_accuracy, 
+        inference_digit_accuracy
     )

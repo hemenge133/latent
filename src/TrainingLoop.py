@@ -21,7 +21,7 @@ from contextlib import nullcontext
 from transformers import get_cosine_schedule_with_warmup, get_linear_schedule_with_warmup
 from src.Metrics import evaluate
 from src.Losses import SequenceAccuracyLoss
-from src.Training import generate_evaluation_examples, setup_models_training, set_seed
+from src.Training import setup_models_training, set_seed
 
 # Get the logger
 logger = logging.getLogger(__name__)
@@ -579,34 +579,14 @@ def train_models_parallel(
         """
         return tqdm(total=total, desc=desc, ncols=100, leave=True)
     
-    # Generate evaluation examples with lower range for easier evaluation
-    try:
-        # Define min_digits based on args parameter
-        min_digits = 1
-        if args is not None:
-            min_digits = args.min_digits
-            
-        eval_max_val = 999 if min_digits >= 3 else (99 if min_digits == 2 else 9)
-        logger.info(f"Precomputing val set with range 10-{min(5, eval_max_val)}")
-        eval_examples = generate_evaluation_examples(dataset, device, min_digits)
-        logger.info(f"Created {len(eval_examples)} evaluation examples")
-        
-    except Exception as e:
-        logger.error(f"Error generating evaluation examples: {e}")
-        logger.info("Adding fallback examples")
-        # Add some basic fallback examples
-        eval_examples = []
-        for a, b in [(2, 3), (4, 5), (3, 7)]:
-            input_str = f"{a}*{b}"
-            input_tokens = dataset.encode(input_str)
-            input_tensor = torch.tensor([input_tokens], dtype=torch.long).to(device)
-            result = a * b
-            result_str = str(result)
-            eval_examples.append((input_tensor, result_str, a, b))
-    
     # Main training loop
-    val_freq = 50  # Validate every 50 steps
+    val_freq = 50  # Validate basic metrics frequently
+    inference_val_freq = 500 # Validate full inference less frequently
     
+    # Store the latest inference metrics separately
+    latest_inference_sequence_accuracy = {m: 0.0 for m in models_dict}
+    latest_inference_digit_accuracy = {m: 0.0 for m in models_dict}
+
     try:
         # Reset random states for consistent data ordering
         if start_step > 0:
@@ -904,143 +884,149 @@ def train_models_parallel(
                     # Step the learning rate scheduler
                     model_info["scheduler"].step()
                     
-                    # Validation and checkpoint saving
-                    save_checkpoint = False
-                    perform_validation = False
-                    
-                    # Check if custom checkpoint frequency is set
-                    if args is not None and hasattr(args, 'save_every') and args.save_every is not None:
-                        # Use custom checkpoint frequency
-                        if model_info["step"] % args.save_every == 0:
-                            save_checkpoint = True
-                            # Also perform validation when saving checkpoint
-                            perform_validation = True
-                    else:
-                        # Use default validation frequency
-                        if model_info["step"] > 0 and model_info["step"] % val_freq == 0:
-                            perform_validation = True
-                            save_checkpoint = True
-                    
-                    if perform_validation:
-                        # Determine if we should rotate validation examples
-                        rotate_examples = model_info["step"] > 3000 and model_info["step"] % (val_freq * 4) == 0
+                    # --- Validation --- 
+                    current_step = model_info["step"]
+                    perform_basic_validation = current_step > 0 and current_step % val_freq == 0
+                    perform_full_validation = current_step > 0 and current_step % inference_val_freq == 0
+                    save_checkpoint = args.save_every is not None and current_step > 0 and current_step % args.save_every == 0
+
+                    # Always perform full validation if it's due, otherwise basic
+                    if perform_full_validation:
+                        logger.info(f"--- Performing FULL validation for {model_info['name']} at step {current_step} ---")
+                        val_loss, tf_acc, inf_seq_acc, inf_dig_acc = evaluate(
+                            model=model,
+                            data_loader=val_loader,
+                            criterion=criterion,
+                            dataset=dataset, 
+                            device=device,
+                            desc=f"FullVal {model_info['name']}",
+                            calculate_inference=True
+                        )
+                        logger.info(f"--- Full Validation complete. Loss={val_loss:.4f}, InfAcc={inf_seq_acc:.2%} ---")
                         
-                        val_loss, val_sequence_accuracy, val_digit_accuracy = evaluate(
+                        # Store all metrics
+                        model_info["val_loss"] = val_loss
+                        model_info["val_teacher_forced_accuracy"] = tf_acc
+                        model_info["val_sequence_accuracy"] = inf_seq_acc # Used for best model check & Optuna
+                        model_info["val_digit_accuracy"] = inf_dig_acc
+                        latest_inference_sequence_accuracy[model_type] = inf_seq_acc
+                        latest_inference_digit_accuracy[model_type] = inf_dig_acc
+                        
+                        # Log all metrics
+                        writer = model_info["writer"]
+                        logger.info(f"--- Logging FULL validation metrics for {model_info['name']} to TensorBoard ---")
+                        writer.add_scalar('val/loss', val_loss, current_step)
+                        writer.add_scalar('val/teacher_forced_accuracy', tf_acc, current_step)
+                        writer.add_scalar('val/inference_sequence_accuracy', inf_seq_acc, current_step)
+                        writer.add_scalar('val/inference_digit_accuracy', inf_dig_acc, current_step)
+                        writer.flush()
+                        logger.info(f"--- Finished logging full validation metrics ---")
+                        
+                        # Check for best model based on validation loss after full eval
+                        if val_loss < model_info["best_val_loss"]:
+                            model_info["best_val_loss"] = val_loss
+                            # ... (Save best model checkpoint logic - unchanged) ...
+                            model_checkpoint_dir = f"checkpoints/{model_info['name'].lower()}"
+                            os.makedirs(model_checkpoint_dir, exist_ok=True)
+                            current_lr = optimizer.param_groups[0]['lr']
+                            best_config_dict = {
+                                'd_model': args.d_model if args and hasattr(args, 'd_model') else getattr(model, 'd_model', None),
+                                'num_layers': args.num_layers if args and hasattr(args, 'num_layers') else getattr(model, 'num_layers', None),
+                                'num_latent': args.num_latent if args and hasattr(args, 'num_latent') else getattr(model, 'num_latent', None),
+                                'seed': args.seed if args and hasattr(args, 'seed') else 42,
+                                'batch_size': args.batch_size if args and hasattr(args, 'batch_size') else None,
+                                'min_digits': args.min_digits if args and hasattr(args, 'min_digits') else None,
+                                'max_digits': args.max_digits if args and hasattr(args, 'max_digits') else None,
+                                'accuracy_weight': args.accuracy_weight if args and hasattr(args, 'accuracy_weight') else None,
+                                'tf_schedule': tf_schedule, 
+                                'tf_start_step': tf_start_step, 
+                                'max_steps': max_steps 
+                            }
+                            torch.save({
+                                'step': current_step,
+                                'model_state_dict': model.state_dict(),
+                                'optimizer_state_dict': optimizer.state_dict(),
+                                'scheduler_state_dict': model_info["scheduler"].state_dict(),
+                                'val_loss': val_loss,
+                                'val_sequence_accuracy': inf_seq_acc, # Save inference accuracy
+                                'config': best_config_dict, 
+                                'last_lr': current_lr,
+                            }, f"{model_checkpoint_dir}/{model_info['name'].lower()}_best.pt")
+                            logger.info(f"Saved new best model for {model_info['name']} (val_loss: {val_loss:.6f}, inf_acc: {inf_seq_acc:.2%})")
+
+                    elif perform_basic_validation:
+                        # Only perform basic (fast) validation
+                        # logger.info(f"--- Performing BASIC validation for {model_info['name']} at step {current_step} ---") # Optional logging
+                        val_loss, tf_acc, _, _ = evaluate(
                             model=model,
                             data_loader=val_loader,
                             criterion=criterion,
                             dataset=dataset,
                             device=device,
-                            vocab_size=vocab_size,
-                            desc=f"Val {model_info['name']}",
-                            examples=eval_examples,
-                            rotate_examples=rotate_examples
+                            desc=f"BasicVal {model_info['name']}",
+                            calculate_inference=False # Skip slow inference
                         )
+                        # logger.info(f"--- Basic Validation complete. Loss={val_loss:.4f} ---") # Optional logging
                         
-                        # Store validation metrics
+                        # Store only basic metrics
                         model_info["val_loss"] = val_loss
-                        model_info["val_sequence_accuracy"] = val_sequence_accuracy
-                        model_info["val_digit_accuracy"] = val_digit_accuracy
-                        
-                        # Log validation metrics using the current model step
-                        writer.add_scalar('val/loss', val_loss, model_info["step"])
-                        writer.add_scalar('val/sequence_accuracy', val_sequence_accuracy, model_info["step"])
-                        writer.add_scalar('val/digit_accuracy', val_digit_accuracy, model_info["step"])
-                        
-                        # Print validation results
-                        logger.info(f"\n{model_info['name']} - Step {model_info['step']}/{max_steps} - Val Loss: {val_loss:.6f} - Seq Acc: {val_sequence_accuracy:.2%}")
-                        
-                        # Check for best model and save if improved
-                        if val_loss < model_info["best_val_loss"]:
-                            model_info["best_val_loss"] = val_loss
-                            # Save best model checkpoint
-                            model_checkpoint_dir = f"checkpoints/{model_info['name'].lower()}"
-                            os.makedirs(model_checkpoint_dir, exist_ok=True)
-                            current_lr = optimizer.param_groups[0]['lr']
-                            # --- Construct Config Dict from args/model --- 
-                            best_config_dict = {
-                                # Pull from args if available, otherwise maybe model properties
-                                'd_model': args.d_model if args and hasattr(args, 'd_model') else getattr(model, 'd_model', None), 
-                                'num_layers': args.num_layers if args and hasattr(args, 'num_layers') else getattr(model, 'num_layers', None),
-                                'num_latent': args.num_latent if args and hasattr(args, 'num_latent') else getattr(model, 'num_latent', None),
-                                'seed': args.seed if args and hasattr(args, 'seed') else 42,
-                                'batch_size': args.batch_size if args and hasattr(args, 'batch_size') else None,
-                                'min_digits': args.min_digits if args and hasattr(args, 'min_digits') else None,
-                                'max_digits': args.max_digits if args and hasattr(args, 'max_digits') else None,
-                                'accuracy_weight': args.accuracy_weight if args and hasattr(args, 'accuracy_weight') else None,
-                                # Use run variables for TF schedule state
-                                'tf_schedule': tf_schedule, 
-                                'tf_start_step': tf_start_step, 
-                                'max_steps': max_steps # Actual max steps for the run
-                            }
-                            # --- End Construct Config Dict --- 
+                        model_info["val_teacher_forced_accuracy"] = tf_acc
+                        # Keep previous inference scores until next full validation
+                        model_info["val_sequence_accuracy"] = latest_inference_sequence_accuracy[model_type]
+                        model_info["val_digit_accuracy"] = latest_inference_digit_accuracy[model_type]
+
+                        # Log only basic metrics frequently
+                        writer = model_info["writer"]
+                        # logger.info(f"--- Logging BASIC validation metrics for {model_info['name']} to TensorBoard ---") # Optional logging
+                        writer.add_scalar('val/loss', val_loss, current_step)
+                        writer.add_scalar('val/teacher_forced_accuracy', tf_acc, current_step)
+                        # Log the *last known* inference metrics to keep the graph populated
+                        writer.add_scalar('val/inference_sequence_accuracy', latest_inference_sequence_accuracy[model_type], current_step)
+                        writer.add_scalar('val/inference_digit_accuracy', latest_inference_digit_accuracy[model_type], current_step)
+                        writer.flush()
+                        # logger.info(f"--- Finished logging basic validation metrics ---") # Optional logging
+
+                    # Always save latest checkpoint if frequency is met, regardless of validation type
+                    if save_checkpoint:
+                        # ... (Save latest model checkpoint logic - unchanged) ...
+                        model_checkpoint_dir = f"checkpoints/{model_info['name'].lower()}"
+                        os.makedirs(model_checkpoint_dir, exist_ok=True)
+                        current_lr = optimizer.param_groups[0]['lr']
+                        save_path = f"{model_checkpoint_dir}/{model_info['name'].lower()}_latest.pt"
+                        latest_config_dict = {
+                            'd_model': args.d_model if args and hasattr(args, 'd_model') else getattr(model, 'd_model', None),
+                            'num_layers': args.num_layers if args and hasattr(args, 'num_layers') else getattr(model, 'num_layers', None),
+                            'num_latent': args.num_latent if args and hasattr(args, 'num_latent') else getattr(model, 'num_latent', None),
+                            'seed': args.seed if args and hasattr(args, 'seed') else 42,
+                            'batch_size': args.batch_size if args and hasattr(args, 'batch_size') else None,
+                            'min_digits': args.min_digits if args and hasattr(args, 'min_digits') else None,
+                            'max_digits': args.max_digits if args and hasattr(args, 'max_digits') else None,
+                            'accuracy_weight': args.accuracy_weight if args and hasattr(args, 'accuracy_weight') else None,
+                            'tf_schedule': tf_schedule, 
+                            'tf_start_step': tf_start_step, 
+                            'tf_current_probability': tf_prob, 
+                            'max_steps': max_steps
+                        }
+                        logger.info(f"Attempting to save latest checkpoint for {model_info['name']} at step {current_step} to {save_path}")
+                        try:
                             torch.save({
-                                'step': model_info["step"],
                                 'model_state_dict': model.state_dict(),
                                 'optimizer_state_dict': optimizer.state_dict(),
                                 'scheduler_state_dict': model_info["scheduler"].state_dict(),
-                                'val_loss': val_loss,
-                                'val_sequence_accuracy': val_sequence_accuracy,
-                                'config': best_config_dict, # Use constructed dict
+                                'step': current_step,
+                                'val_loss': model_info.get("val_loss", float('inf')),
+                                'val_sequence_accuracy': model_info.get("val_sequence_accuracy", 0.0), # Use the stored one
+                                'config': latest_config_dict,
                                 'last_lr': current_lr,
-                            }, f"{model_checkpoint_dir}/{model_info['name'].lower()}_best.pt")
-                            logger.info(f"Saved new best model for {model_info['name']} (val_loss: {val_loss:.6f})")
-                        
-                            # Return to training mode
-                            model.train()
-                        
-                        # Save latest checkpoint if needed
-                        if save_checkpoint:
-                            model_checkpoint_dir = f"checkpoints/{model_info['name'].lower()}"
-                            os.makedirs(model_checkpoint_dir, exist_ok=True)
-                            current_lr = optimizer.param_groups[0]['lr']
-                            save_path = f"{model_checkpoint_dir}/{model_info['name'].lower()}_latest.pt"
+                                'stability_window': model_info.get("stability_window", 100),
+                                'recent_losses_mean': sum(model_info["recent_losses"])/len(model_info["recent_losses"]) if model_info["recent_losses"] else 0.0,
+                            }, save_path) 
+                            logger.info(f"Successfully saved latest checkpoint for {model_info['name']} to {save_path}")
+                        except Exception as save_err:
+                            logger.error(f"!!! FAILED to save latest checkpoint for {model_info['name']} to {save_path} !!!")
+                            logger.error(f"Save error: {save_err}")
+                            logger.error(traceback.format_exc())
                             
-                            # --- Construct Config Dict from args/model --- 
-                            latest_config_dict = {
-                                'd_model': args.d_model if args and hasattr(args, 'd_model') else getattr(model, 'd_model', None), 
-                                'num_layers': args.num_layers if args and hasattr(args, 'num_layers') else getattr(model, 'num_layers', None),
-                                'num_latent': args.num_latent if args and hasattr(args, 'num_latent') else getattr(model, 'num_latent', None),
-                                'seed': args.seed if args and hasattr(args, 'seed') else 42,
-                                'batch_size': args.batch_size if args and hasattr(args, 'batch_size') else None,
-                                'min_digits': args.min_digits if args and hasattr(args, 'min_digits') else None,
-                                'max_digits': args.max_digits if args and hasattr(args, 'max_digits') else None,
-                                'accuracy_weight': args.accuracy_weight if args and hasattr(args, 'accuracy_weight') else None,
-                                # Use run variables for TF schedule state
-                                'tf_schedule': tf_schedule, 
-                                'tf_start_step': tf_start_step, 
-                                'tf_current_probability': tf_prob, # Save current TF prob
-                                'max_steps': max_steps # Actual max steps for the run
-                            }
-                            # --- End Construct Config Dict --- 
-
-                            # --- Add detailed save logging/error handling ---
-                            logger.info(f"Attempting to save latest checkpoint for {model_info['name']} at step {model_info['step']} to {save_path}")
-                            try:
-                                torch.save({
-                                    'model_state_dict': model.state_dict(),
-                                    'optimizer_state_dict': optimizer.state_dict(),
-                                    'scheduler_state_dict': model_info["scheduler"].state_dict(),
-                                    'step': model_info["step"],
-                                    'val_loss': model_info.get("val_loss", float('inf')),
-                                    'val_sequence_accuracy': model_info.get("val_sequence_accuracy", 0.0),
-                                    'config': latest_config_dict, # Use constructed dict
-                                    'last_lr': current_lr,
-                                    # Save additional training state (not part of config)
-                                    'stability_window': model_info.get("stability_window", 100),
-                                    'recent_losses_mean': sum(model_info["recent_losses"])/len(model_info["recent_losses"]) if model_info["recent_losses"] else 0.0,
-                                }, save_path) 
-                                logger.info(f"Successfully saved latest checkpoint for {model_info['name']} to {save_path}")
-                            except Exception as save_err:
-                                logger.error(f"!!! FAILED to save latest checkpoint for {model_info['name']} to {save_path} !!!")
-                                logger.error(f"Save error: {save_err}")
-                                logger.error(traceback.format_exc())
-                            # --- End detailed save logging --- 
-                            
-                            if not perform_validation:
-                                # Only log this if we haven't already logged validation results (redundant log now?)
-                                # logger.info(f"Saved checkpoint for {model_info['name']} at step {model_info['step']}")
-                                pass # Logging handled above
                 except Exception as e:
                     logger.error(f"Error in training step for {model_info['name']}: {e}")
                     logger.error(f"Traceback: {traceback.format_exc()}")
@@ -1082,20 +1068,20 @@ def train_models_parallel(
         
     # Final validation for both models
     for model_type, model_info in models_dict.items():
-        final_val_loss, final_sequence_accuracy, final_digit_accuracy = evaluate(
+        final_val_loss, final_teacher_forced_accuracy, final_inference_sequence_accuracy, final_inference_digit_accuracy = evaluate(
             model=model_info["model"],
             data_loader=val_loader,
             criterion=model_info["criterion"],
             dataset=dataset,
             device=device,
-            vocab_size=vocab_size,
             desc=f"Final {model_info['name']} validation",
-            examples=eval_examples
+            calculate_inference=True # Ensure final eval includes inference
         )
         
         model_info["final_loss"] = final_val_loss
-        model_info["final_sequence_accuracy"] = final_sequence_accuracy
-        model_info["final_digit_accuracy"] = final_digit_accuracy
+        model_info["final_teacher_forced_accuracy"] = final_teacher_forced_accuracy
+        model_info["final_sequence_accuracy"] = final_inference_sequence_accuracy
+        model_info["final_digit_accuracy"] = final_inference_digit_accuracy
     
     training_time = time.time() - start_time
     
